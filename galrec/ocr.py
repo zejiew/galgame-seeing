@@ -71,6 +71,9 @@ def get_engine():
             return _ENGINE
         try:
             from rapidocr_onnxruntime import RapidOCR
+            # 不传参数，用库自带默认配置：它内部会挑可用 provider。
+            # 之前试过显式指定 use_cuda 系列参数，但不同版本的参数名不一致，
+            # 传错会被 **kwargs 吞掉而不报错，反而更难排查。
             _ENGINE = RapidOCR()
         except Exception as e:
             _ENGINE_FAILED = f"OCR 初始化失败：{e}"
