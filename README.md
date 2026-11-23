@@ -3,9 +3,33 @@
 检测 galgame 剧情在推进还是已经停下，自动控制 OBS 开始/停止录制。
 可选「自动推进」：替你按键推进剧情，遇到选项自动停手。
 
+> 仓库：https://github.com/zejiew/galgame-seeing
+
 ---
 
-## 一、先决条件（重要）
+## 零、直接用 exe（不想装 Python 的话）
+
+双击 `release\GalgameAutoRec.exe` 即可，无需安装 Python。
+
+- 目录里 `GalgameAutoRec.exe` 是主程序（约 6 MB），
+  `_internal\` 是它依赖的运行库（约 190 MB），**整个文件夹要一起拷走**，不能只拿 exe
+- 首次运行会在 exe 同目录生成 `config.yaml` 和 `recordings\`
+- 想确认环境是否就绪：命令行执行 `GalgameAutoRec.exe selfcheck`，
+  结果会写到同目录的 `selfcheck.txt` 并自动打开
+
+自己重新打包：
+
+```bash
+python build_exe.py              # 目录模式，启动快（推荐）
+python build_exe.py --onefile    # 单文件，体积大、启动慢
+```
+
+打包脚本已经处理了两件容易踩的事：rapidocr 的 onnx 模型是数据文件必须显式带上；
+环境里装着的 paddle / torch / PySide6 等无关大包要排除掉（否则产物会从 190 MB 涨到 3 GB）。
+
+---
+
+## 一、先决条件（装 Python 跑源码时看）
 
 ### 1. OBS 版本
 
@@ -14,16 +38,13 @@
 | **28 及以上** | 直接可用 | 内建 obs-websocket 5.x，功能最全 |
 | **27** | 装插件 或 用热键 | 装 obs-websocket 4.9.1 插件（本目录有安装脚本）；或改用「热键」控制方式，什么都不用装 |
 
-**你的机器目前是 OBS 27.2.4。建议升级到 28+（当前最新 33.0.3）**，
-升级后 WebSocket 内建，本程序能自动拿到文件名、读录制时长，体验最好。
+OBS 28+ 体验最好：程序能自动拿到文件名、读录制时长。
 
-升级地址：https://obsproject.com/download
+下载：https://obsproject.com/download
 
-### 2. Python 依赖
+### 2. Python 依赖（仅源码运行需要）
 
-本程序只用了这些库，且**都在你机器上已装好**：
-
-- `numpy` / `Pillow` / `opencv` — 截图与图像比对
+- `numpy` / `Pillow` — 截图与图像比对
 - `pywin32` — 窗口枚举与定位
 - `rapidocr-onnxruntime` — 本地 OCR（纯 CPU、离线、无需联网）
 - `websocket-client` — 连 OBS
@@ -220,8 +241,11 @@ OBS 里换「游戏捕获」或「窗口捕获」，显示器捕获在独占全�
 
 ```
 galgame录制/
+├── GalgameAutoRec.exe          ← 打包后的主程序（release/ 里）
 ├── main.py                    入口（gui / cli / selfcheck / probe）
-├── config.yaml                配置（首次运行后自动生成）
+├── build_exe.py               打包脚本
+├── config.example.yaml        配置样例（运行时生成 config.yaml）
+├── 启动.bat                    源码方式启动
 ├── 安装WebSocket插件(OBS27).bat
 ├── galrec/
 │   ├── config.py              配置读写
@@ -236,6 +260,7 @@ galgame录制/
 │   ├── recorder.py            总调度（检测 → 开关录制 → 文件管理）
 │   ├── selector.py            屏幕框选
 │   └── gui.py                 tkinter 界面
+├── release/                   ← 打包产物（exe + _internal）
 ├── recordings/                默认录制输出目录
 └── tests/
     ├── simulate.py            检测全链路模拟（假游戏窗口，含遮挡干扰）
@@ -251,11 +276,19 @@ galgame录制/
 
 | 测试 | 内容 | 结果 |
 |---|---|---|
-| `selfcheck` | 依赖、OCR、窗口、OBS、目录 | 通过（OBS 未开时该项预期失败） |
+| `selfcheck` | 依赖、OCR、窗口、OBS、目录（源码与 exe 各自验证） | 通过 |
 | `test_obs_protocol` | v5/v4 握手、认证、录制控制、错误密码拒绝、热键解析、台词过滤 | 全部通过 |
 | `test_advance` | 选项识别、真发按键、选项停手、前台保护、卡住检测 | 全部通过 |
 | `simulate` | 假游戏窗口喂台词，验证自动开录/停录、遮挡干扰 | 通过 |
-| `e2e_obs_v5` | 真 OBS 33（便携版）连接、录制、文件产出、Controller 全链路 | 核心链路通过* |
+| `e2e_obs_v5` | 真 OBS 33（便携版）连接、录制、文件产出、Controller 全链路 | 核心链路通过 |
+| exe 自检 | 打包后在 exe 内跑 selfcheck：OCR 模型加载 0.5s、tkinter、窗口枚举 | 通过 |
 
-\* 便携版 OBS 在无桌面会话下手动配源时录制输出不稳定，与程序逻辑无关。
-在正常桌面环境用你的正式 OBS 时录制正常（已实测产出 2.2 MB / 3 秒素材）。
+说明：便携版 OBS 在无桌面会话下手动配源时录制输出不稳定，与程序逻辑无关；
+在正常桌面环境用正式 OBS 时录制正常（已实测产出 2.2 MB / 3 秒素材）。
+
+**已知限制**
+
+- 结束判定依赖「台词换句」。纯过场 CG（长时间无台词）会被当成剧情结束而停录，
+  这是设计取舍；需要避开时把「结束判定」调大（如 300 秒）
+- OCR 需要游戏有可读文字。全语音无字幕的作品只能靠「画面一动就开」模式
+- 自动推进默认关闭，且不做选项选择（遇选项即停手）
