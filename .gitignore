@@ -1,0 +1,57 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.spec
+develop-eggs/
+.eggs/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 打包产物 ----
+# exe 太大不进仓库，用 Release 或网盘分发
+*.exe
+*.dll.out
+_internal/
+GalgameAutoRec/
+release/
+
+# ---- 项目运行产物 ----
+# 录制视频
+recordings/
+recordings_v5/
+*.mp4
+*.mkv
+*.flv
+*.ts
+*.m4v
+
+# 运行时生成的配置（含本机路径与 OBS 密码，绝不能提交）
+config.yaml
+selfcheck.txt
+*.log
+
+# ---- 测试与临时 ----
+_b/
+_tmp/
+_dl/
+_probe/
+_obsportable/
+_obs33/
+test.png
+_ocr*.png
+_*.png
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.bak
+.DS_Store
+Thumbs.db

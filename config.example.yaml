@@ -1,0 +1,61 @@
+obs:
+  host: 127.0.0.1
+  port: 4455
+  password: ''
+  protocol: auto
+  backend: auto
+  hotkey_start: ''
+  hotkey_stop: ''
+  auto_launch: true
+  exe_path: C:\Program Files\obs-studio\bin\64bit\obs64.exe
+  record_dir: recordings
+  set_record_dir: true
+  scene: ''
+  stop_delay: 2.0
+detect:
+  window_title: ''
+  process_name: ''
+  use_foreground: false
+  poll_interval: 0.6
+  change_threshold: 2.0
+  idle_timeout: 120.0
+  start_grace: 20.0
+  min_record_seconds: 15.0
+  max_record_seconds: 14400
+  confirm_ticks: 2
+  settle_frames: 2
+  text_lost_timeout: 0.0
+  segmented: true
+  require_dialogue: true
+  detect_occlusion: true
+  occlusion_timeout: 180.0
+  choice_check: true
+  choice_check_interval: 0.0
+  region_rel: null
+  auto_region: true
+  auto_region_retry: 20.0
+  ocr: true
+  ocr_min_conf: 0.55
+  ocr_interval: 1.2
+  dialogue_min_chars: 4
+record:
+  start_mode: on_dialogue
+  stop_mode: on_end
+  pause_when_unfocused: false
+  unfocus_grace: 90.0
+  filename_template: '{game}_{time}'
+  delete_short: true
+  remux: false
+  ffmpeg: ''
+advance:
+  enabled: false
+  mode: key
+  key: space
+  click_pos: null
+  delay_after_text: 2.5
+  min_interval: 1.2
+  stop_on_choice: true
+  choice_confirm: 2
+  stop_when_stuck: true
+  stuck_limit: 8
+  auto_resume_text_change: true
