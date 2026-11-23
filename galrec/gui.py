@@ -1,6 +1,9 @@
 """tkinter 图形界面。
 
-设计原则：一屏看完全部信息——左边状态与台词，右边设置，底部日志。
+设计原则：一屏看完全部信息——上边一条标题栏，左边状态与台词，右边设置，
+卡片式分区，背景是天蓝渐变 + 二次元点缀（樱瓣、光斑）。
+配色与样式集中在 ``ui_theme``，改风格只动那一个文件。
+
 线程模型：检测器跑在后台线程，所有 UI 更新通过队列回到主线程，避免 Tk 跨线程崩溃。
 """
 from __future__ import annotations
@@ -14,24 +17,31 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from . import __version__, capture, ocr, obs as obsmod, windows
+from . import ui_theme as T
 from .config import DEFAULT_CONFIG_NAME, Config
 from .detector import Phase, Snapshot
 from .recorder import Controller, Session
 from .selector import RegionMask, RegionSelector
 
 APP_TITLE = "Galgame 自动录制助手"
-FONT_UI = ("Microsoft YaHei UI", 9)
-FONT_BOLD = ("Microsoft YaHei UI", 9, "bold")
-FONT_MONO = ("Consolas", 9)
-FONT_TITLE = ("Microsoft YaHei UI", 13, "bold")
-FONT_DIALOGUE = ("Microsoft YaHei UI", 11)
+APP_SUBTITLE = "剧情自动录制 · 由 OBS 驱动的 galgame 助手"
 
-PHASE_TEXT = {
-    Phase.IDLE: ("待机", "#888888"),
-    Phase.ARMED: ("监控中 · 等待剧情", "#2f81f7"),
-    Phase.RECORDING: ("● 录制中", "#e5484d"),
-    Phase.COOLDOWN: ("等待下一段剧情", "#d29922"),
+# 兼容旧名字（其它模块/测试可能引用）
+FONT_UI = T.FONT_UI
+FONT_BOLD = T.FONT_BOLD
+FONT_MONO = T.FONT_MONO
+FONT_TITLE = T.FONT_TITLE
+FONT_DIALOGUE = T.FONT_DIALOGUE
+
+# 阶段 → (胶囊文字, 胶囊底色, 文字色)
+PHASE_STYLE = {
+    Phase.IDLE: ("待机", "#E7F2F9", T.TEXT_SOFT),
+    Phase.ARMED: ("监控中 · 等待剧情", T.ACCENT, "#FFFFFF"),
+    Phase.RECORDING: ("● 录制中", T.SAKURA, "#FFFFFF"),
+    Phase.COOLDOWN: ("等待下一段剧情", T.AMBER, "#FFFFFF"),
 }
+# 兼容旧引用
+PHASE_TEXT = {k: (v[0], v[1]) for k, v in PHASE_STYLE.items()}
 
 
 class App(tk.Tk):
@@ -49,178 +59,315 @@ class App(tk.Tk):
         self.ctrl.on_ui_event = lambda k, p: self._q.put((k, p))
         self._banner_shown = False
         self._win_map = {}
+        self._phase = Phase.IDLE
+        self._pulse_on = False
 
         self.title(f"{APP_TITLE}  v{__version__}")
-        self.geometry("1180x800")
-        self.minsize(1040, 700)
+        # 任务栏 / 标题栏图标：用 logo 那张图
+        try:
+            icon = T.app_icon_image(64)
+            if icon is not None and hasattr(T, "ImageTk"):
+                self._icon_photo = T.ImageTk.PhotoImage(icon)
+                self.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
+        # 按屏幕大小定初始尺寸，别一开就顶满 1920×1080 的边
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(1200, max(980, sw - 200))
+        h = min(940, max(700, sh - 70))
+        self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 4)}")
+        self.configure(bg=T.SKY_MID)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_style()
         self._build_ui()
+        # 状态栏测完最小尺寸再锁住，避免窗口能拖到把卡片挤扁
+        self.update_idletasks()
+        self.minsize(max(980, self.winfo_reqwidth() - 40),
+                     max(660, min(760, self.winfo_reqheight())))
         self.after(100, self._drain)
         self.after(200, self._boot)
+        self.after(700, self._pulse)
 
     # ------------------------------------------------------------------ #
     # 外观
     # ------------------------------------------------------------------ #
     def _build_style(self):
-        style = ttk.Style(self)
-        # clam 主题下 Checkbutton 的勾选标记会被画成「×」，
-        # 看起来像「未勾选」，容易误读。默认用 vista（Win10/11 原生外观），
-        # 只有它不可用时才退回 clam。
-        for theme in ("vista", "winnative", "clam"):
-            try:
-                if theme in style.theme_names():
-                    style.theme_use(theme)
-                    break
-            except Exception:
-                continue
-        style.configure(".", font=FONT_UI)
-        style.configure("Hint.TLabel", foreground="#6b7280",
-                        font=("Microsoft YaHei UI", 8))
-        style.configure("Title.TLabel", font=FONT_TITLE)
-        style.configure("TLabelframe.Label", font=FONT_BOLD)
-        style.configure("TButton", padding=(10, 4))
-        style.configure("Accent.TButton", font=FONT_BOLD)
-        style.configure("TNotebook.Tab", padding=(14, 6))
+        # 整套 ttk 样式（含自绘勾选框）交给 ui_theme，图片对象要在这里保活
+        self._theme_kept = T.install_styles(self)
+        self._images = self._theme_kept.get("images", [])
 
     # ------------------------------------------------------------------ #
     # 布局
     # ------------------------------------------------------------------ #
     def _build_ui(self):
-        root = ttk.Frame(self, padding=10)
-        root.pack(fill="both", expand=True)
-        root.columnconfigure(0, weight=5, minsize=480)
-        root.columnconfigure(1, weight=4, minsize=470)
-        root.rowconfigure(1, weight=1)
+        # 背景画布：既画渐变，也当布局容器（子部件浮在画布上，卡片间隙露出渐变）
+        self.bg = T.GradientCanvas(self)
+        self.bg.pack(fill="both", expand=True)
+        self.bg.columnconfigure(0, weight=5, minsize=460)
+        self.bg.columnconfigure(1, weight=4, minsize=440)
+        for r in range(8):
+            self.bg.rowconfigure(r, weight=0)
+        # 台词框给固定高度，多出来的空间全给日志与录制表
+        self.bg.rowconfigure(4, weight=5, minsize=120)
+        self.bg.rowconfigure(5, weight=4, minsize=120)
 
-        # ============ 顶部：控制条 ============ #
-        top = ttk.Frame(root)
-        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        top.columnconfigure(1, weight=1)
-
-        self.btn_run = ttk.Button(top, text="▶  开始监控", style="Accent.TButton",
-                                  command=self._toggle_run, width=14)
-        self.btn_run.grid(row=0, column=0, sticky="w")
-
-        self.lbl_phase = ttk.Label(top, text="待机", style="Title.TLabel")
-        self.lbl_phase.grid(row=0, column=1, sticky="w", padx=12)
-
-        self.lbl_obs = ttk.Label(top, text="OBS 未连接", style="TLabel")
-        self.lbl_obs.grid(row=0, column=2, sticky="e", padx=(0, 8))
-
-        ttk.Button(top, text="连接测试", command=self._test_obs,
-                   width=9).grid(row=0, column=3, sticky="e")
-
-        # ============ 左：状态 ============ #
-        left = ttk.Frame(root)
-        left.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
-        left.columnconfigure(0, weight=1)
-        left.rowconfigure(3, weight=2)
-        left.rowconfigure(4, weight=1)
-
-        # -- 窗口 -- #
-        wf = ttk.LabelFrame(left, text="游戏窗口", padding=8)
-        wf.grid(row=0, column=0, sticky="ew")
-        wf.columnconfigure(0, weight=1)
-        self.cmb_win = ttk.Combobox(wf, state="readonly", height=12)
-        self.cmb_win.grid(row=0, column=0, sticky="ew")
-        self.cmb_win.bind("<<ComboboxSelected>>", lambda e: self._on_pick_window())
-        btns = ttk.Frame(wf)
-        btns.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(btns, text="刷新列表", command=self._refresh_windows,
-                   width=10).pack(side="left")
-        ttk.Button(btns, text="自动识别对话框", command=self._auto_region,
-                   width=16).pack(side="left", padx=6)
-        ttk.Button(btns, text="手动框选区域", command=self._manual_region,
-                   width=13).pack(side="left")
-        self.lbl_region = ttk.Label(wf, text="区域：自动", style="Hint.TLabel")
-        self.lbl_region.grid(row=2, column=0, sticky="w", pady=(6, 0))
-
-        # -- 实时状态 -- #
-        sf = ttk.LabelFrame(left, text="实时状态", padding=8)
-        sf.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        sf.columnconfigure(1, weight=1)
-        self.stat_vars = {}
-        for i, (k, label, init) in enumerate([
-            ("diff", "画面变化", "0.00"),
-            ("idle", "静默时长", "0s"),
-            ("elapsed", "本段时长", "0:00"),
-            ("segments", "已完成段数", "0"),
-        ]):
-            ttk.Label(sf, text=label + "：").grid(row=i, column=0, sticky="w")
-            v = tk.StringVar(value=init)
-            ttk.Label(sf, textvariable=v, font=FONT_MONO).grid(
-                row=i, column=1, sticky="w")
-            self.stat_vars[k] = v
-
-        # -- 当前台词 -- #
-        df = ttk.LabelFrame(left, text="当前台词（OCR）", padding=8)
-        df.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        df.columnconfigure(0, weight=1)
-        self.txt_line = tk.Text(df, height=3, wrap="word", font=FONT_DIALOGUE,
-                                bg="#ffffff", relief="flat", padx=8, pady=6,
-                                foreground="#1f2937")
-        self.txt_line.grid(row=0, column=0, sticky="ew")
-        self.txt_line.configure(state="disabled")
-
-        # -- 日志 -- #
-        lf = ttk.LabelFrame(left, text="运行日志", padding=6)
-        lf.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
-        lf.columnconfigure(0, weight=1)
-        lf.rowconfigure(0, weight=1)
-        self.txt_log = tk.Text(lf, height=9, wrap="word", font=FONT_MONO,
-                               bg="#0f172a", fg="#cbd5e1", relief="flat",
-                               padx=8, pady=6)
-        self.txt_log.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(lf, command=self.txt_log.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.txt_log.configure(yscrollcommand=sb.set)
-        for tag, color in (("info", "#cbd5e1"), ("ok", "#4ade80"),
-                           ("warn", "#fbbf24"), ("error", "#f87171")):
-            self.txt_log.tag_configure(tag, foreground=color)
-
-        # -- 录制记录 -- #
-        rf = ttk.LabelFrame(left, text="本次录制", padding=6)
-        rf.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
-        rf.columnconfigure(0, weight=1)
-        rf.rowconfigure(0, weight=1)
-        cols = ("n", "dur", "reason", "file")
-        self.tree = ttk.Treeview(rf, columns=cols, show="headings", height=4)
-        for c, t, w in (("n", "#", 34), ("dur", "时长", 60),
-                        ("reason", "停止原因", 92), ("file", "文件", 240)):
-            self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="w" if c == "file" else "center")
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        self.tree.bind("<Double-1>", self._open_session)
-
-        # ============ 右：设置 ============ #
-        right = ttk.Frame(root)
-        right.grid(row=1, column=1, sticky="nsew")
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
-
-        self.nb = ttk.Notebook(right)
-        self.nb.grid(row=0, column=0, sticky="nsew")
-        self._build_tab_obs()
-        self._build_tab_detect()
-        self._build_tab_record()
-        self._build_tab_advance()
-
-        bar = ttk.Frame(right)
-        bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(bar, text="保存设置", command=self._save_cfg).pack(side="right")
-        ttk.Button(bar, text="恢复默认", command=self._reset_cfg).pack(side="right", padx=6)
+        self._build_header()
+        self._build_left()
+        self._build_right()
 
         self._log(f"配置：{self.cfg_path}", "info")
         self._refresh_windows(quiet=True)
         self._load_cfg_to_ui()
 
+    # -- 顶部标题栏 -- #
+    def _build_header(self):
+        # 横幅本身就是一块渐变画布：logo、标题都直接画上去。
+        # （子 Label 有自己的纯色底，压在渐变上会显出一个方块，所以不用 Label）
+        bar = T.Banner(self.bg, height=86, radius=16,
+                       c1="#B7E5FA", c2="#3E96D1")
+        bar.configure(bg=T.SKY_LOW)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew",
+                 padx=14, pady=(12, 8))
+        self.banner = bar
+
+        # 标志：圆形头像（有 logo.jpg 就用它，没有退回花瓣字符）
+        # 直接画在横幅画布上——套一层 Canvas 的话，它那块纯色底会在
+        # 渐变上留下一个方块，圆形头像的四个角就藏不住了。
+        logo_size = 56
+        logo_photo = T.logo_photo(logo_size, ring="#FFFFFF", ring_w=3)
+        if logo_photo is not None:
+            self._images.append(logo_photo)
+            bar.create_image(16, (86 - logo_size) // 2, anchor="nw",
+                             image=logo_photo)
+        else:
+            bar.create_oval(16, 15, 16 + logo_size, 15 + logo_size,
+                            fill="#FFFFFF", outline="")
+            bar.create_text(16 + logo_size / 2, 15 + logo_size / 2 + 1,
+                            text=T.ICON_SAKURA, fill=T.SAKURA,
+                            font=(T.FAMILY, 20, "bold"))
+
+        # 标题 / 副标题：两行之间留足空隙，不再贴在一起
+        tx = 16 + logo_size + 18
+        bar.create_text(tx, 31, anchor="w", text=APP_TITLE, fill="#FFFFFF",
+                        font=(T.FAMILY, 17, "bold"))
+        bar.create_text(tx + 1, 65, anchor="w", text=APP_SUBTITLE,
+                        fill="#EAF7FF", font=(T.FAMILY, 9))
+
+        # 右侧一块白色圆角面板，控件都放面板里（同色底，看不出边）
+        panel_w, panel_h = 470, 54
+        self._panel_photo = T.rrect_photo(panel_w, panel_h, panel_h // 2,
+                                          "#FFFFFF")
+        if self._panel_photo is not None:
+            self._images.append(self._panel_photo)
+            bar.create_image(-999, 0, anchor="nw", image=self._panel_photo,
+                             tags="panel")
+        else:
+            bar.create_rectangle(-999, 0, -999 + panel_w, panel_h,
+                                 fill="#FFFFFF", outline="", tags="panel")
+
+        holder = tk.Frame(bar, bg="#FFFFFF")
+        holder.place(relx=1.0, x=-12, y=16, anchor="ne",
+                     width=panel_w, height=panel_h)
+        bar.bind("<Configure>", lambda e: self._place_banner_panel(
+            bar, holder, panel_w, panel_h), add="+")
+        self._banner_panel = (holder, panel_w, panel_h)
+
+        inner = tk.Frame(holder, bg="#FFFFFF")
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.pill_phase = T.PillLabel(inner, "待机", bg="#FFFFFF",
+                                      fill="#E7F2F9", fg=T.TEXT_SOFT,
+                                      height=30, min_width=112)
+        self.pill_phase.pack(side="left", padx=(6, 0))
+
+        self.lbl_obs = tk.Label(inner, text=f"{T.ICON_DOT} OBS 未连接",
+                                bg="#FFFFFF", fg=T.RED,
+                                font=T.FONT_SMALL, anchor="w")
+        self.lbl_obs.pack(side="left", padx=(14, 10))
+
+        self.btn_run = T.PillButton(inner, "▶  开始监控",
+                                    command=self._toggle_run, kind="primary",
+                                    bg="#FFFFFF", height=38, min_width=140)
+        self.btn_run.pack(side="left")
+
+        self.btn_conn = tk.Canvas(inner, width=96, height=32, bg="#FFFFFF",
+                                  highlightthickness=0, bd=0, cursor="hand2")
+        self.btn_conn.pack(side="left", padx=(8, 6))
+        self._draw_ghost_btn(self.btn_conn, "连接测试", 96, 32, hover=False)
+        self.btn_conn.bind("<Enter>", lambda e: self._draw_ghost_btn(
+            self.btn_conn, "连接测试", 96, 32, hover=True))
+        self.btn_conn.bind("<Leave>", lambda e: self._draw_ghost_btn(
+            self.btn_conn, "连接测试", 96, 32, hover=False))
+        self.btn_conn.bind("<Button-1>", lambda e: self._test_obs())
+
+    def _place_banner_panel(self, bar, holder, w, h):
+        """让白色圆角面板跟着横幅右边一起移动。"""
+        try:
+            bw = bar.winfo_width()
+            y = max(0, (bar.winfo_height() - h) // 2)
+            holder.place_configure(x=-12, y=y, width=w, height=h, anchor="ne")
+            item = bar.find_withtag("panel")
+            if item:
+                bar.coords(item[0], bw - 12 - w, y)
+                bar.itemconfigure(item[0], anchor="nw")
+        except Exception:
+            pass
+
+    def _draw_ghost_btn(self, cv: tk.Canvas, text: str, w: int, h: int,
+                        hover: bool = False):
+        """浅色描边按钮：白底 + 天蓝描边 + 天蓝字。"""
+        cv.delete("all")
+        bg = "#E4F5FE" if hover else "#F2FBFF"
+        photo = T.rrect_photo(w, h, h // 2, bg,
+                              outline=T.ACCENT if hover else T.BORDER)
+        if photo is not None:
+            self._ghost_photos = getattr(self, "_ghost_photos", [])
+            self._ghost_photos.append(photo)
+            cv.create_image(0, 0, anchor="nw", image=photo)
+        cv.create_text(w / 2, h / 2, text=text, fill=T.ACCENT_DARK,
+                       font=T.FONT_SMALL)
+
+    # -- 左列：状态 -- #
+    def _build_left(self):
+        pad = dict(padx=(14, 7), sticky="nsew")
+
+        # ===== 游戏窗口 ===== #
+        card = T.Card(self.bg, "游戏窗口", icon=T.ICON_SPARK,
+                      subtitle="选中要录的那个游戏")
+        card.grid(row=1, column=0, pady=(0, 8), **pad)
+        body = card.body
+        body.columnconfigure(0, weight=1)
+
+        self.cmb_win = ttk.Combobox(body, state="readonly", height=12)
+        self.cmb_win.grid(row=0, column=0, sticky="ew")
+        self.cmb_win.bind("<<ComboboxSelected>>", lambda e: self._on_pick_window())
+
+        btns = tk.Frame(body, bg=T.CARD_BG)
+        btns.grid(row=1, column=0, sticky="ew", pady=(7, 0))
+        ttk.Button(btns, text="↻  刷新列表", style="Ghost.TButton",
+                   command=self._refresh_windows).pack(side="left")
+        ttk.Button(btns, text="自动识别对话框", style="Ghost.TButton",
+                   command=self._auto_region).pack(side="left", padx=6)
+        ttk.Button(btns, text="手动框选区域", style="Ghost.TButton",
+                   command=self._manual_region).pack(side="left")
+
+        self.lbl_region = tk.Label(body, text="区域：自动", bg=T.CARD_BG,
+                                   fg=T.TEXT_MUTED, font=T.FONT_SMALL, anchor="w")
+        self.lbl_region.grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        # ===== 实时状态 ===== #
+        card = T.Card(self.bg, "实时状态", icon="◈", accent=T.MINT,
+                      subtitle="每秒刷新")
+        card.grid(row=2, column=0, pady=(0, 6), **pad)
+        grid = card.body
+        self.stat_vars = {}
+        tiles = [
+            ("画面变化", "diff", "0.00", T.ACCENT_DARK),
+            ("静默时长", "idle", "0s", T.ACCENT_DARK),
+            ("本段时长", "elapsed", "0:00", T.SAKURA_DARK),
+            ("已完成段数", "segments", "0", T.MINT),
+        ]
+        for i, (cap, key, init, color) in enumerate(tiles):
+            grid.columnconfigure(i, weight=1, uniform="stat")
+            tile = T.StatTile(grid, cap, init, accent=color)
+            tile.grid(row=0, column=i, sticky="nsew",
+                      padx=(0 if i == 0 else 6, 0))
+            self.stat_vars[key] = tile.var
+
+        # ===== 当前台词 ===== #
+        card = T.Card(self.bg, "当前台词", icon="❝", accent=T.SAKURA,
+                      subtitle="OCR 实时读取")
+        card.grid(row=3, column=0, pady=(0, 8), **pad)
+        box = tk.Frame(card.body, bg=T.CARD_SOFT, highlightthickness=1,
+                       highlightbackground=T.BORDER_SOFT, bd=0)
+        box.pack(fill="both", expand=True)
+        self.txt_line = T.AccentText(box, height=3, width=40,
+                                     font=T.FONT_DIALOGUE,
+                                     fg=T.TEXT, bg=T.CARD_SOFT)
+        self.txt_line.pack(fill="both", expand=True, padx=4, pady=2)
+        self.txt_line.configure(state="disabled")
+
+        # ===== 运行日志 ===== #
+        card = T.Card(self.bg, "运行日志", icon="▤",
+                      subtitle="最近 2000 行")
+        card.grid(row=4, column=0, pady=(0, 8), **pad)
+        wrap = tk.Frame(card.body, bg=T.LOG_BG, highlightthickness=0, bd=0)
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        self.txt_log = tk.Text(wrap, height=5, width=40, wrap="word",
+                               font=("Consolas", 9),
+                               bg=T.LOG_BG, fg=T.LOG_FG, relief="flat", bd=0,
+                               highlightthickness=0, padx=10, pady=6,
+                               insertbackground=T.LOG_FG,
+                               selectbackground=T.ACCENT_DARK,
+                               selectforeground="#FFFFFF")
+        self.txt_log.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(wrap, style="Sky.Vertical.TScrollbar",
+                           command=self.txt_log.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.txt_log.configure(yscrollcommand=sb.set)
+        for tag, color in T.LOG_COLORS.items():
+            self.txt_log.tag_configure(tag, foreground=color)
+
+        # ===== 本次录制 ===== #
+        card = T.Card(self.bg, "本次录制", icon="◉", accent=T.AMBER,
+                      subtitle="双击打开所在文件夹")
+        card.grid(row=5, column=0, pady=(0, 14), **pad)
+        twrap = tk.Frame(card.body, bg=T.CARD_BG)
+        twrap.pack(fill="both", expand=True)
+        twrap.columnconfigure(0, weight=1)
+        twrap.rowconfigure(0, weight=1)
+        cols = ("n", "dur", "reason", "file")
+        self.tree = ttk.Treeview(twrap, columns=cols, show="headings", height=3)
+        for c, t, w in (("n", "#", 40), ("dur", "时长", 68),
+                        ("reason", "停止原因", 96), ("file", "文件", 260)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="w" if c == "file" else "center")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tsb = ttk.Scrollbar(twrap, style="Sky.Vertical.TScrollbar",
+                            command=self.tree.yview)
+        tsb.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tsb.set)
+        self.tree.bind("<Double-1>", self._open_session)
+
+    # -- 右列：设置 -- #
+    def _build_right(self):
+        panel = tk.Frame(self.bg, bg=T.CARD_BG, highlightthickness=1,
+                         highlightbackground=T.BORDER, bd=0)
+        panel.grid(row=1, column=1, rowspan=5, sticky="nsew",
+                   padx=(7, 14), pady=(0, 14))
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(1, weight=1)
+
+        head = tk.Frame(panel, bg=T.CARD_BG)
+        head.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 6))
+        head.columnconfigure(1, weight=1)
+        bar = tk.Frame(head, bg=T.ACCENT, width=4, height=15)
+        bar.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        bar.grid_propagate(False)
+        tk.Label(head, text=f"{T.ICON_SPARK}  设置", bg=T.CARD_BG, fg=T.TEXT,
+                 font=T.FONT_CARD_TITLE).grid(row=0, column=1, sticky="w")
+
+        self.nb = ttk.Notebook(panel)
+        self.nb.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        self._build_tab_obs()
+        self._build_tab_detect()
+        self._build_tab_record()
+        self._build_tab_advance()
+
+        bar2 = tk.Frame(panel, bg=T.CARD_BG)
+        bar2.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        ttk.Button(bar2, text="恢复默认", style="Soft.TButton",
+                   command=self._reset_cfg).pack(side="right", padx=(8, 0))
+        ttk.Button(bar2, text="保存设置", style="Primary.TButton",
+                   command=self._save_cfg).pack(side="right")
+
     # ------------------------------------------------------------------ #
     # 设置页：OBS
     # ------------------------------------------------------------------ #
     def _build_tab_obs(self):
-        f = ttk.Frame(self.nb, padding=12)
-        self.nb.add(f, text="  OBS  ")
+        f = self._tab_body("  OBS  ")
         f.columnconfigure(1, weight=1)
         r = 0
 
@@ -240,67 +387,60 @@ class App(tk.Tk):
 
         r = self._row_combo(f, r, "控制方式", self.v_backend,
                             ["auto", "websocket", "hotkey"])
-        ttk.Label(f, text="websocket 功能全；hotkey 不用装插件（OBS 27 走这条）",
-                  style="Hint.TLabel", wraplength=430).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(0, 8)); r += 1
+        r = self._hint(f, r, "websocket 功能全；hotkey 不用装插件（OBS 27 走这条）")
 
         r = self._row_entry(f, r, "地址", self.v_host, width=18)
         r = self._row_entry(f, r, "端口", self.v_port, width=18)
         r = self._row_entry(f, r, "密码", self.v_pw, width=18, show="*")
         r = self._row_combo(f, r, "协议", self.v_proto, ["auto", "v5", "v4"])
-        ttk.Label(f, text="OBS 28+ 用 v5（内建）；OBS 27 装 obs-websocket 4.x 插件后用 v4；auto 自动试。",
-                  style="Hint.TLabel", wraplength=430).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(0, 8)); r += 1
+        r = self._hint(f, r, "OBS 28+ 用 v5（内建）；OBS 27 装 obs-websocket 4.x "
+                             "插件后用 v4；auto 自动试。")
 
         r = self._row_entry(f, r, "热键·开始", self.v_hk_start, width=18)
         r = self._row_entry(f, r, "热键·停止", self.v_hk_stop, width=18)
-        ttk.Label(f, text="例：ctrl+alt+f9。要先去 OBS 设置 → 热键，把「开始录制/停止录制」设成同样的组合。",
-                  style="Hint.TLabel", wraplength=430).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(0, 8)); r += 1
-
-        ttk.Separator(f, orient="horizontal").grid(
-            row=r, column=0, columnspan=3, sticky="ew", pady=6); r += 1
+        r = self._hint(f, r, "例：ctrl+alt+f9。要先去 OBS 设置 → 热键，把"
+                             "「开始录制/停止录制」设成同样的组合。")
+        r = self._sep(f, r)
 
         r = self._row_entry(f, r, "OBS 程序", self.v_exe, width=30)
-        ttk.Button(f, text="…", width=3,
+        ttk.Button(f, text="…", width=3, style="Soft.TButton",
                    command=lambda: self._pick_file(self.v_exe,
                                                    [("OBS", "obs64.exe"),
                                                     ("程序", "*.exe")])
-                   ).grid(row=r - 1, column=2, sticky="w", padx=(4, 0))
+                   ).grid(row=r - 1, column=2, sticky="w", padx=(6, 0))
 
         r = self._row_entry(f, r, "场景名", self.v_scene, width=18)
-        ttk.Label(f, text="留空用当前场景", style="Hint.TLabel").grid(
-            row=r - 1, column=2, sticky="w", padx=(4, 0))
+        self._note(f, r - 1, "留空用当前场景", padx=(6, 0))
 
         r = self._row_entry(f, r, "录制目录", self.v_obs_dir, width=30)
-        ttk.Button(f, text="…", width=3,
+        ttk.Button(f, text="…", width=3, style="Soft.TButton",
                    command=lambda: self._pick_dir(self.v_obs_dir)).grid(
-            row=r - 1, column=2, sticky="w", padx=(4, 0))
+            row=r - 1, column=2, sticky="w", padx=(6, 0))
 
         r = self._row_entry(f, r, "停录宽限(秒)", self.v_stopdelay, width=10)
-        ttk.Label(f, text="结束后多录几秒", style="Hint.TLabel").grid(
-            row=r - 1, column=2, sticky="w", padx=(4, 0))
+        self._note(f, r - 1, "结束后多录几秒", padx=(6, 0))
 
         r += 1
         ttk.Checkbutton(f, text="连接时把 OBS 录制目录改到上面这个",
+                        style="Sky.TCheckbutton",
                         variable=self.v_setdir).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
+            row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
         ttk.Checkbutton(f, text="OBS 没开就自动启动它",
+                        style="Sky.TCheckbutton",
                         variable=self.v_autolaunch).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
+            row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=r, column=0, columnspan=3, sticky="ew", pady=8); r += 1
-        self.lbl_obs_detail = ttk.Label(f, text="", style="Hint.TLabel",
-                                        wraplength=430, justify="left")
+        r = self._sep(f, r)
+        self.lbl_obs_detail = tk.Label(f, text="", bg=T.CARD_BG, fg=T.TEXT_MUTED,
+                                       font=T.FONT_SMALL, justify="left",
+                                       anchor="w", wraplength=430)
         self.lbl_obs_detail.grid(row=r, column=0, columnspan=3, sticky="w")
 
     # ------------------------------------------------------------------ #
     # 设置页：检测
     # ------------------------------------------------------------------ #
     def _build_tab_detect(self):
-        f = ttk.Frame(self.nb, padding=12)
-        self.nb.add(f, text="  检测  ")
+        f = self._tab_body("  检测  ")
         f.columnconfigure(1, weight=1)
         r = 0
 
@@ -328,11 +468,9 @@ class App(tk.Tk):
         ]
         for label, var, hint in rows:
             r = self._row_entry(f, r, label, var, width=10)
-            ttk.Label(f, text=hint, style="Hint.TLabel").grid(
-                row=r - 1, column=2, sticky="w", padx=(6, 0))
+            self._note(f, r - 1, hint)
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=r, column=0, columnspan=3, sticky="ew", pady=8); r += 1
+        r = self._sep(f, r)
 
         for var, text in [
             (self.v_ocr, "用 OCR 读台词（推荐，判断最准）"),
@@ -341,26 +479,27 @@ class App(tk.Tk):
             (self.v_segmented, "停录后剧情再动时另起一段"),
             (self.v_detect_occ, "检测窗口是否被其它窗口挡住"),
         ]:
-            ttk.Checkbutton(f, text=text, variable=var).grid(
-                row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
+            ttk.Checkbutton(f, text=text, style="Sky.TCheckbutton",
+                            variable=var).grid(
+                row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=r, column=0, columnspan=3, sticky="ew", pady=8); r += 1
-        ttk.Label(f, text="OCR 状态：").grid(row=r, column=0, sticky="w")
-        self.lbl_ocr = ttk.Label(f, text="检查中…", style="Hint.TLabel",
-                                 wraplength=330, justify="left")
+        r = self._sep(f, r)
+        tk.Label(f, text="OCR 状态", bg=T.CARD_BG, fg=T.TEXT_SOFT,
+                 font=T.FONT_BOLD).grid(row=r, column=0, sticky="nw")
+        self.lbl_ocr = tk.Label(f, text="检查中…", bg=T.CARD_BG, fg=T.TEXT_MUTED,
+                                font=T.FONT_SMALL, justify="left", anchor="w",
+                                wraplength=330)
         self.lbl_ocr.grid(row=r, column=1, columnspan=2, sticky="w"); r += 1
 
-        ttk.Button(f, text="在这块区域上试识别一次",
-                   command=self._test_ocr).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Button(f, text=f"{T.ICON_SPARK}  在这块区域上试识别一次",
+                   style="Ghost.TButton", command=self._test_ocr).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
     # ------------------------------------------------------------------ #
     # 设置页：录制
     # ------------------------------------------------------------------ #
     def _build_tab_record(self):
-        f = ttk.Frame(self.nb, padding=12)
-        self.nb.add(f, text="  录制  ")
+        f = self._tab_body("  录制  ")
         f.columnconfigure(1, weight=1)
         r = 0
 
@@ -371,59 +510,66 @@ class App(tk.Tk):
         self.v_delshort = tk.BooleanVar()
         self.v_ffmpeg = tk.StringVar()
 
-        ttk.Label(f, text="开始条件").grid(row=r, column=0, sticky="w", pady=4)
-        box = ttk.Frame(f)
-        box.grid(row=r, column=1, columnspan=2, sticky="w")
+        # 单选框整组独占一行：塞在第三列里时，滚动区宽度不够会把最后一个选项切掉
+        tk.Label(f, text="开始条件", bg=T.CARD_BG, fg=T.TEXT_SOFT,
+                 font=T.FONT_UI).grid(row=r, column=0, columnspan=3, sticky="w",
+                                      pady=(2, 0)); r += 1
+        box = tk.Frame(f, bg=T.CARD_BG)
+        box.grid(row=r, column=0, columnspan=3, sticky="w", pady=(1, 4))
         for val, text in (("on_dialogue", "出现新台词时"),
                           ("on_window", "画面一动就开"),
                           ("manual", "完全手动")):
-            ttk.Radiobutton(box, text=text, value=val,
-                            variable=self.v_start_mode).pack(side="left", padx=(0, 10))
+            ttk.Radiobutton(box, text=text, value=val, style="Sky.TRadiobutton",
+                            variable=self.v_start_mode).pack(side="left",
+                                                             padx=(0, 14))
         r += 1
 
-        ttk.Label(f, text="停止条件").grid(row=r, column=0, sticky="w", pady=4)
-        box2 = ttk.Frame(f)
-        box2.grid(row=r, column=1, columnspan=2, sticky="w")
+        tk.Label(f, text="停止条件", bg=T.CARD_BG, fg=T.TEXT_SOFT,
+                 font=T.FONT_UI).grid(row=r, column=0, columnspan=3, sticky="w",
+                                      pady=(2, 0)); r += 1
+        box2 = tk.Frame(f, bg=T.CARD_BG)
+        box2.grid(row=r, column=0, columnspan=3, sticky="w", pady=(1, 4))
         for val, text in (("on_end", "剧情结束自动停"), ("manual", "只手动停")):
-            ttk.Radiobutton(box2, text=text, value=val,
-                            variable=self.v_stop_mode).pack(side="left", padx=(0, 10))
+            ttk.Radiobutton(box2, text=text, value=val, style="Sky.TRadiobutton",
+                            variable=self.v_stop_mode).pack(side="left",
+                                                            padx=(0, 14))
         r += 1
 
         r = self._row_entry(f, r, "文件名模板", self.v_tpl, width=26)
-        ttk.Label(f, text="可用 {game} {time} {date} {index}",
-                  style="Hint.TLabel").grid(row=r - 1, column=2, sticky="w",
-                                            padx=(6, 0))
+        self._note(f, r - 1, "可用 {game} {time} {date} {index}")
 
         r = self._row_entry(f, r, "ffmpeg", self.v_ffmpeg, width=26)
-        ttk.Button(f, text="…", width=3,
+        ttk.Button(f, text="…", width=3, style="Soft.TButton",
                    command=lambda: self._pick_file(
                        self.v_ffmpeg, [("ffmpeg", "ffmpeg.exe"),
                                        ("程序", "*.exe")])
-                   ).grid(row=r - 1, column=2, sticky="w", padx=(4, 0))
+                   ).grid(row=r - 1, column=2, sticky="w", padx=(6, 0))
 
         r += 1
         ttk.Checkbutton(f, text="录制完用 ffmpeg 转封装为 mp4",
+                        style="Sky.TCheckbutton",
                         variable=self.v_remux).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
-        ttk.Checkbutton(f, text="自动删除太短的录像",
+            row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
+        ttk.Checkbutton(f, text="自动删除太短的录像", style="Sky.TCheckbutton",
                         variable=self.v_delshort).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
+            row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
-        ttk.Label(f, text="小工具", style=FONT_BOLD and "TLabel").grid(
-            row=r, column=0, columnspan=3, sticky="w"); r += 1
-        ttk.Button(f, text="打开录制目录", command=self._open_rec_dir).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
-        ttk.Button(f, text="打开 OBS", command=self._launch_obs).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
+        r = self._sep(f, r)
+        tk.Label(f, text="小工具", bg=T.CARD_BG, fg=T.TEXT_SOFT,
+                 font=T.FONT_CARD_TITLE).grid(row=r, column=0, columnspan=3,
+                                              sticky="w"); r += 1
+        tools = tk.Frame(f, bg=T.CARD_BG)
+        tools.grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(tools, text="打开录制目录", style="Ghost.TButton",
+                   command=self._open_rec_dir).pack(side="left")
+        ttk.Button(tools, text="打开 OBS", style="Ghost.TButton",
+                   command=self._launch_obs).pack(side="left", padx=8)
 
     # ------------------------------------------------------------------ #
     # 设置页：自动推进
     # ------------------------------------------------------------------ #
     def _build_tab_advance(self):
-        f = ttk.Frame(self.nb, padding=12)
-        self.nb.add(f, text="  自动推进  ")
+        f = self._tab_body("  自动推进  ")
         f.columnconfigure(1, weight=1)
         r = 0
 
@@ -437,89 +583,127 @@ class App(tk.Tk):
         self.v_adv_stuck_n = tk.StringVar()
 
         ttk.Checkbutton(f, text="启用自动推进（替你按键推进剧情）",
+                        style="Sky.TCheckbutton",
                         variable=self.v_adv_on).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=(0, 6)); r += 1
 
-        ttk.Label(f, text="⚠ 这是可选功能，默认关闭。开关打开后才会真的按键。",
-                  style="Hint.TLabel", foreground="#b45309",
-                  wraplength=440, justify="left").grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(0, 8)); r += 1
+        warn = tk.Frame(f, bg=T.AMBER_SOFT, highlightthickness=0, bd=0)
+        warn.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 10)); r += 1
+        tk.Label(warn, text="⚠  这是可选功能，默认关闭。开关打开后才会真的按键。",
+                 bg=T.AMBER_SOFT, fg="#A9741F", font=T.FONT_SMALL,
+                 justify="left", anchor="w", wraplength=420,
+                 padx=10, pady=8).pack(fill="x")
 
         r = self._row_combo(f, r, "方式", self.v_adv_mode,
                             ["key", "mouse", "both"])
-        ttk.Label(f, text="key=按键盘；mouse=点鼠标；both=都发",
-                  style="Hint.TLabel").grid(row=r - 1, column=2, sticky="w",
-                                            padx=(6, 0))
+        self._note(f, r - 1, "key=按键盘；mouse=点鼠标；both=都发")
 
         r = self._row_combo(f, r, "按键", self.v_adv_key,
                             ["space", "enter", "ctrl", "z", "x"])
-        ttk.Label(f, text="多数 galgame 按 space 或 enter 推进",
-                  style="Hint.TLabel").grid(row=r - 1, column=2, sticky="w",
-                                            padx=(6, 0))
+        self._note(f, r - 1, "多数 galgame 按 space 或 enter 推进")
 
         r = self._row_entry(f, r, "台词后等待(秒)", self.v_adv_delay, width=10)
-        ttk.Label(f, text="这句显示完多久才按，别打断打字机",
-                  style="Hint.TLabel").grid(row=r - 1, column=2, sticky="w",
-                                            padx=(6, 0))
+        self._note(f, r - 1, "这句显示完多久才按，别打断打字机")
 
         r = self._row_entry(f, r, "最小间隔(秒)", self.v_adv_interval, width=10)
-        ttk.Label(f, text="两次按键之间至少隔多久",
-                  style="Hint.TLabel").grid(row=r - 1, column=2, sticky="w",
-                                            padx=(6, 0))
+        self._note(f, r - 1, "两次按键之间至少隔多久")
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=r, column=0, columnspan=3, sticky="ew", pady=8); r += 1
+        r = self._sep(f, r)
 
         ttk.Checkbutton(f, text="遇到选项自动停手（强烈建议开着）",
+                        style="Sky.TCheckbutton",
                         variable=self.v_adv_choice).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
+            row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
         ttk.Checkbutton(f, text="连续按了没反应就停（防卡死在选项/小游戏）",
+                        style="Sky.TCheckbutton",
                         variable=self.v_adv_stuck).grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=2); r += 1
+            row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
 
         r = self._row_entry(f, r, "卡住判定次数", self.v_adv_stuck_n, width=10)
-        ttk.Label(f, text="按这么多次台词还没变就停",
-                  style="Hint.TLabel").grid(row=r - 1, column=2, sticky="w",
-                                            padx=(6, 0))
+        self._note(f, r - 1, "按这么多次台词还没变就停")
 
-        ttk.Separator(f, orient="horizontal").grid(
-            row=r, column=0, columnspan=3, sticky="ew", pady=8); r += 1
+        r = self._sep(f, r)
 
-        self.lbl_adv = ttk.Label(f, text="状态：未启用", style="Hint.TLabel",
-                                 wraplength=440, justify="left")
+        self.lbl_adv = tk.Label(f, text="状态：未启用", bg=T.CARD_BG,
+                                fg=T.TEXT_MUTED, font=T.FONT_SMALL,
+                                justify="left", anchor="w", wraplength=430)
         self.lbl_adv.grid(row=r, column=0, columnspan=3, sticky="w"); r += 1
 
-        box = ttk.Frame(f)
-        box.grid(row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Button(box, text="立即暂停推进", width=14,
+        box = tk.Frame(f, bg=T.CARD_BG)
+        box.grid(row=r, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Button(box, text="立即暂停推进", style="Ghost.TButton",
                    command=self._pause_advance).pack(side="left")
-        ttk.Button(box, text="恢复推进", width=10,
-                   command=self._resume_advance).pack(side="left", padx=6)
-        ttk.Button(box, text="试按一次", width=10,
+        ttk.Button(box, text="恢复推进", style="Ghost.TButton",
+                   command=self._resume_advance).pack(side="left", padx=8)
+        ttk.Button(box, text="试按一次", style="Ghost.TButton",
                    command=self._test_advance).pack(side="left")
         r += 1
 
-        ttk.Label(f, text="提示：按键只发给前台窗口。切出去看视频/聊天时程序不会按键，"
-                          "切回游戏后自动继续。",
-                  style="Hint.TLabel", wraplength=440, justify="left").grid(
-            row=r, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        tk.Label(f, text="提示：按键只发给前台窗口。切出去看视频/聊天时程序不会按键，"
+                         "切回游戏后自动继续。",
+                 bg=T.CARD_BG, fg=T.TEXT_MUTED, font=T.FONT_SMALL,
+                 justify="left", anchor="w", wraplength=430).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     # ------------------------------------------------------------------ #
     # 通用行构造
     # ------------------------------------------------------------------ #
+    def _tab_body(self, title: str) -> tk.Frame:
+        """新建一个设置页并返回可放内容的容器（外层带滚动）。
+
+        标签列定宽；输入列吃掉剩余宽度；行尾提示列按内容自动定宽
+        （提示自己的 wraplength 已经把长度压住了，不要再硬锁列宽）。
+        """
+        holder = ttk.Frame(self.nb, padding=0)
+        self.nb.add(holder, text=title)
+        sc = T.ScrollFrame(holder, bg=T.CARD_BG)
+        sc.pack(fill="both", expand=True)
+        body = tk.Frame(sc.inner, bg=T.CARD_BG, padx=16, pady=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=0, minsize=92)
+        body.columnconfigure(1, weight=1, minsize=150)
+        body.columnconfigure(2, weight=0)
+        return body
+
     def _row_entry(self, parent, r, label, var, width=20, show=""):
-        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", pady=3,
-                                           padx=(0, 8))
+        tk.Label(parent, text=label, bg=T.CARD_BG, fg=T.TEXT_SOFT,
+                 font=T.FONT_UI).grid(row=r, column=0, sticky="w", pady=4,
+                                      padx=(0, 10))
         e = ttk.Entry(parent, textvariable=var, width=width, show=show)
         e.grid(row=r, column=1, sticky="ew")
         return r + 1
 
     def _row_combo(self, parent, r, label, var, values):
-        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", pady=3,
-                                           padx=(0, 8))
+        tk.Label(parent, text=label, bg=T.CARD_BG, fg=T.TEXT_SOFT,
+                 font=T.FONT_UI).grid(row=r, column=0, sticky="w", pady=4,
+                                      padx=(0, 10))
         c = ttk.Combobox(parent, textvariable=var, values=values, width=17,
                          state="readonly")
         c.grid(row=r, column=1, sticky="w")
+        return r + 1
+
+    def _note(self, parent, r, text, padx=(8, 0)):
+        """行尾的灰色小提示。
+
+        放进设置页的第三列时，长句会被滚动区的可视宽度裁掉（滚动条让
+        可用宽度少十几像素），所以这里改成「窄列 + 自身换行」，
+        宽度只在必要时撑开，不跟输入框抢空间。
+        """
+        tk.Label(parent, text=text, bg=T.CARD_BG, fg=T.TEXT_MUTED,
+                 font=T.FONT_SMALL, justify="left", anchor="w",
+                 wraplength=176).grid(row=r, column=2, sticky="w",
+                                      padx=(padx[0], 6))
+
+    def _hint(self, parent, r, text):
+        tk.Label(parent, text=text, bg=T.CARD_BG, fg=T.TEXT_MUTED,
+                 font=T.FONT_SMALL, justify="left", anchor="w",
+                 wraplength=440).grid(row=r, column=0, columnspan=3, sticky="w",
+                                      pady=(0, 10))
+        return r + 1
+
+    def _sep(self, parent, r, pady=8):
+        tk.Frame(parent, bg=T.BORDER_SOFT, height=1).grid(
+            row=r, column=0, columnspan=3, sticky="ew", pady=pady)
         return r + 1
 
     def _pick_file(self, var, types):
@@ -600,8 +784,7 @@ class App(tk.Tk):
             ph = Phase(s.phase)
         except ValueError:
             ph = Phase.IDLE
-        text, color = PHASE_TEXT.get(ph, ("未知", "#888"))
-        self.lbl_phase.configure(text=text, foreground=color)
+        self._set_phase(ph)
         self.stat_vars["diff"].set(f"{s.diff:.2f}")
         self.stat_vars["idle"].set(_fmt_dur(s.idle))
         self.stat_vars["elapsed"].set(_fmt_mmss(s.elapsed))
@@ -613,6 +796,26 @@ class App(tk.Tk):
             self.lbl_region.configure(
                 text=f"区域：{s.note or '自动'}  ({x0},{y0}) {x1-x0}×{y1-y0}")
         self._refresh_adv_label()
+
+    def _set_phase(self, ph: Phase):
+        self._phase = ph
+        text, fill, fg = PHASE_STYLE.get(ph, ("未知", "#9FB6C6", "#FFFFFF"))
+        try:
+            self.pill_phase.set(text, fill=fill, fg=fg)
+        except Exception:
+            pass
+
+    def _pulse(self):
+        """录制中让胶囊轻微呼吸，一眼就能看出还在录。"""
+        try:
+            if self._phase == Phase.RECORDING:
+                self._pulse_on = not self._pulse_on
+                self.pill_phase.set("● 录制中",
+                                    fill=T.SAKURA if self._pulse_on else "#FFB3D2",
+                                    fg="#FFFFFF")
+        except Exception:
+            pass
+        self.after(620, self._pulse)
 
     def _set_dialogue(self, text: str):
         self.txt_line.configure(state="normal")
@@ -631,17 +834,18 @@ class App(tk.Tk):
 
     def _apply_obs(self, st: obsmod.ObsStatus):
         if st.connected:
-            self.lbl_obs.configure(text="OBS 已连接", foreground="#16a34a")
-            extra = f"方式：{st.protocol}\n版本：{st.obs_version or '未知'}"
-            extra += f"\n录制目录：{st.record_dir or '(未知)'}"
+            self.lbl_obs.configure(text=f"{T.ICON_DOT} OBS 已连接", fg=T.MINT)
+            extra = f"方式：{st.protocol}    版本：{st.obs_version or '未知'}\n"
+            extra += f"录制目录：{st.record_dir or '(未知)'}"
             if st.recording:
                 extra += f"\n正在录制：{_fmt_mmss(st.duration)}"
-            self.lbl_obs_detail.configure(text=extra)
+            self.lbl_obs_detail.configure(text=extra, fg=T.TEXT_SOFT)
         else:
-            self.lbl_obs.configure(text="OBS 未连接", foreground="#b91c1c")
+            self.lbl_obs.configure(text=f"{T.ICON_DOT} OBS 未连接", fg=T.RED)
             self.lbl_obs_detail.configure(
                 text=st.message or "点「连接测试」查看原因\n"
-                                   "OBS 27 需装 obs-websocket 插件，或改用热键模式")
+                                   "OBS 27 需装 obs-websocket 插件，或改用热键模式",
+                fg=T.TEXT_MUTED)
 
     def _apply_windows(self, wins):
         self._win_map = {}
@@ -676,8 +880,9 @@ class App(tk.Tk):
     def _toggle_run(self):
         if self.ctrl.running:
             self.ctrl.stop()
-            self.btn_run.configure(text="▶  开始监控")
-            self.lbl_phase.configure(text="待机", foreground="#888")
+            self.btn_run.set_text("▶  开始监控")
+            self.btn_run.set_kind("primary")
+            self._set_phase(Phase.IDLE)
             return
         self._collect_ui()
         hwnd = self._selected_hwnd()
@@ -705,7 +910,8 @@ class App(tk.Tk):
                 "或在设置页把「控制方式」改成 hotkey\n"
                 "· 检查地址/端口/密码是否与 OBS 里一致")
             return
-        self.btn_run.configure(text="■  停止监控")
+        self.btn_run.set_text("■  停止监控")
+        self.btn_run.set_kind("stop")
 
     def _test_obs(self):
         self._collect_ui()
@@ -886,12 +1092,15 @@ class App(tk.Tk):
         st = self.ctrl.advance_state
         if not st.enabled:
             txt = "状态：未启用"
+            color = T.TEXT_MUTED
         elif st.paused:
             txt = f"状态：已暂停（{st.pause_reason}）  已推进 {st.actions} 次"
+            color = T.AMBER
         else:
             txt = f"状态：运行中  已推进 {st.actions} 次"
+            color = T.MINT
         try:
-            self.lbl_adv.configure(text=txt)
+            self.lbl_adv.configure(text=txt, fg=color)
         except Exception:
             pass
 

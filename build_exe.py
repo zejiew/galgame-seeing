@@ -116,6 +116,7 @@ def build(onefile: bool = False) -> int:
         # 项目自己的包
         "--hidden-import", "galrec",
         "--hidden-import", "galrec.gui",
+        "--hidden-import", "galrec.ui_theme",
         "--hidden-import", "galrec.recorder",
         "--hidden-import", "galrec.detector",
         "--hidden-import", "galrec.advance",
@@ -158,6 +159,11 @@ def build(onefile: bool = False) -> int:
         args.append("--onefile")
     else:
         args.append("--onedir")
+
+    # 界面用的图片资源（logo 等）：随包带上，主题模块按 galrec/assets 去找
+    assets_dir = os.path.join(BASE, "galrec", "assets")
+    if os.path.isdir(assets_dir):
+        args += ["--add-data", f"{assets_dir}{os.pathsep}galrec/assets"]
 
     # 图标（有就用）
     ico = os.path.join(BASE, "app.ico")

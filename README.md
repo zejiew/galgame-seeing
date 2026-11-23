@@ -3,6 +3,10 @@
 检测 galgame 剧情在推进还是已经停下，自动控制 OBS 开始/停止录制。
 可选「自动推进」：替你按键推进剧情，遇到选项自动停手。
 
+界面走天蓝渐变 + 二次元风格：卡片式分区、胶囊按钮、圆形头像，右上角一眼看到当前是待机还是录制中。
+
+![主界面](docs/screenshots/main.png)
+
 > 仓库：https://github.com/zejiew/galgame-seeing
 
 ---
@@ -235,6 +239,11 @@ OBS 里换「游戏捕获」或「窗口捕获」，显示器捕获在独占全�
 **Q: 中文乱码 / 界面字体难看**
 需要系统里有微软雅黑（Windows 自带）。
 
+**Q: 想换界面配色 / 换头像**
+界面风格集中在 `galrec/ui_theme.py` 顶部那组颜色常量里，改完重启即可。
+右上角的圆形头像读的是 `galrec/assets/logo.jpg`，直接换这张图就行，代码不用动
+（打包时会自动带上，见 `build_exe.py` 的 `--add-data`）。
+
 ---
 
 ## 九、文件结构
@@ -259,6 +268,9 @@ galgame录制/
 │   ├── hotkey.py              全局热键发送
 │   ├── recorder.py            总调度（检测 → 开关录制 → 文件管理）
 │   ├── selector.py            屏幕框选
+│   ├── ui_theme.py            界面主题（天蓝渐变配色、卡片、胶囊按钮、头像）
+│   ├── assets/
+│   │   └── logo.jpg           界面头像 / 程序图标原图
 │   └── gui.py                 tkinter 界面
 ├── release/                   ← 打包产物（exe + _internal）
 ├── recordings/                默认录制输出目录
