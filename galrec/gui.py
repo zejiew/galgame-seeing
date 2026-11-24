@@ -456,6 +456,7 @@ class App(tk.Tk):
         self.v_require_dlg = tk.BooleanVar()
         self.v_segmented = tk.BooleanVar()
         self.v_detect_occ = tk.BooleanVar()
+        self.v_occ_fallback = tk.BooleanVar()
 
         rows = [
             ("采样间隔(秒)", self.v_interval, "0.3~2，越小越灵敏也越费 CPU"),
@@ -478,6 +479,7 @@ class App(tk.Tk):
             (self.v_require_dlg, "必须有台词才算剧情开始"),
             (self.v_segmented, "停录后剧情再动时另起一段"),
             (self.v_detect_occ, "检测窗口是否被其它窗口挡住"),
+            (self.v_occ_fallback, "被挡住时从窗口后台抓图（多数 galgame 支持）"),
         ]:
             ttk.Checkbutton(f, text=text, style="Sky.TCheckbutton",
                             variable=var).grid(
@@ -1164,6 +1166,7 @@ class App(tk.Tk):
         self.v_require_dlg.set(c.detect.require_dialogue)
         self.v_segmented.set(c.detect.segmented)
         self.v_detect_occ.set(c.detect.detect_occlusion)
+        self.v_occ_fallback.set(c.detect.occluded_fallback)
 
         self.v_start_mode.set(c.record.start_mode)
         self.v_stop_mode.set(c.record.stop_mode)
@@ -1221,6 +1224,7 @@ class App(tk.Tk):
         c.detect.require_dialogue = bool(self.v_require_dlg.get())
         c.detect.segmented = bool(self.v_segmented.get())
         c.detect.detect_occlusion = bool(self.v_detect_occ.get())
+        c.detect.occluded_fallback = bool(self.v_occ_fallback.get())
 
         c.record.start_mode = self.v_start_mode.get() or "on_dialogue"
         c.record.stop_mode = self.v_stop_mode.get() or "on_end"
@@ -1293,7 +1297,7 @@ def _reason_text(reason: str) -> str:
     return {
         "idle": "剧情结束", "window_closed": "窗口关闭",
         "max_duration": "达上限", "manual": "手动",
-        "occluded": "被遮挡", "error": "异常",
+        "occluded": "被遮挡", "minimized": "最小化", "error": "异常",
     }.get(reason, reason or "-")
 
 

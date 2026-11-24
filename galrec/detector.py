@@ -43,6 +43,7 @@ class StopReason(str, Enum):
     MAXDUR = "max_duration"
     MANUAL = "manual"
     OCCLUDED = "occluded"      # 窗口被遮住太久
+    MINIMIZED = "minimized"    # 窗口被最小化（OBS 抓不到，只会录到黑屏）
     ERROR = "error"
 
 
@@ -83,6 +84,9 @@ class Detector:
         self.hwnd = 0
         self.win: Optional[windows.WindowInfo] = None
         self._grabber: Optional[capture.Grabber] = None
+        self._wgrabber: Optional[capture.WindowGrabber] = None  # 遮挡时的后台抓图通道
+        self._win_grab_ok: Optional[bool] = None   # None=还没试过
+        self._win_grab_tried = 0.0                 # 上次探测后台抓图的时间
         self._region_rel = None      # (x0,y0,x1,y1) 相对客户区的比例
         self._auto_rel = None        # 自动探测出来的区域
 
@@ -107,6 +111,8 @@ class Detector:
         self._segments = 0
         self._blank_streak = 0
         self._occluded_since = 0.0
+        self._minimized_since = 0.0
+        self._minimized_warned = False
         self._auto_try_ts = 0.0
         self._idle = 0.0
         self._last_snap = Snapshot()
@@ -148,6 +154,9 @@ class Detector:
             self.hwnd = hwnd
             self.win = w
             self._grabber = None
+            self._wgrabber = None
+            self._win_grab_ok = None   # 换窗口了，后台抓图能力要重新探测
+            self._win_grab_tried = 0.0
             self._auto_rel = None
             self._region_rel = self._cfg_rel()
         return True
@@ -207,46 +216,112 @@ class Detector:
                 self._set_phase(Phase.IDLE, note="窗口已关闭")
                 return
 
-        # 2) 确定采样区域
+        # 2) 最小化检查必须放在「算采样区域」之前。
+        #    窗口最小化时 GetWindowRect 会给 -32000，区域算不出来会直接 return，
+        #    那样 _check_end 永远跑不到，就会一直录黑屏。
+        now0 = time.time()
+        if self.win and windows.is_iconic(self.win.hwnd):
+            if not self._minimized_since:
+                self._minimized_since = now0
+            self._emit_once_minimized()
+            if self.phase is Phase.RECORDING:
+                if now0 - self._minimized_since >= d.minimized_timeout:
+                    self._end_segment(StopReason.MINIMIZED)
+            self._snap(note="⚠ 游戏窗口已最小化，OBS 会录到黑屏")
+            return
+        self._minimized_since = 0.0
+
+        # 3) 确定采样区域
         bbox, region_desc = self._resolve_bbox()
         if not bbox:
-            self._snap(note="窗口最小化或无客户区")
+            self._snap(note="窗口无有效客户区")
             return
         if self._grabber is None or self._grabber.bbox != bbox:
             self._grabber = capture.Grabber(bbox)
 
-        # 3) 抓帧 + 变化量
-        diff, _fp, img = self._grabber.update()
+        # 3.5) 遮挡检查必须放在抓帧之前。
+        #      窗口被别的窗口盖住时，屏幕截图拿到的是「盖在上面的那个窗口」，
+        #      不是游戏画面。先判断有没有被挡，再决定这一帧从哪条通道取：
+        #        · 没被挡  → 屏幕截图（最快，也不会漏掉独占全屏的情况）
+        #        · 被挡住  → 后门抓图（PrintWindow），直接向窗口要它自己的画面
+        occluded = False
+        if d.detect_occlusion:
+            occluded = not windows.is_region_on_top(self.win.hwnd, bbox)
+        now_occl = time.time()
+
+        # 3.6) 被遮挡时尝试走后门。能不能走通因引擎而异，第一次探测一次就记住。
+        #      探测失败不等于永远失败：有些游戏只在独占全屏时抓不到，
+        #      切成窗口模式就好了，所以隔一阵再试一次。
+        use_window_grab = False
+        if occluded and d.occluded_fallback:
+            if self._win_grab_ok is not True:
+                if self._win_grab_ok is None or \
+                        now_occl - self._win_grab_tried >= 60.0:
+                    self._win_grab_tried = now_occl
+                    self._win_grab_ok = capture.WindowGrabber(self.win.hwnd).probe()
+                    if self._win_grab_ok:
+                        self._emit("info", {"message": (
+                            "窗口被遮挡，已改从窗口后台抓图（PrintWindow）"
+                            "——照常读台词、照常计时")})
+                    else:
+                        self._emit("info", {"message": (
+                            "窗口被遮挡，这个游戏暂时不支持后台抓图，"
+                            "先冻结计时等它露出来（过一会儿会再试）")})
+            use_window_grab = bool(self._win_grab_ok)
+
+        if use_window_grab:
+            # 子区域用「相对客户区」的坐标：屏幕 bbox 减掉客户区原点
+            cl = windows.client_rect(self.win.hwnd)
+            sub = (bbox[0] - cl[0], bbox[1] - cl[1],
+                   bbox[2] - cl[0], bbox[3] - cl[1])
+            if self._wgrabber is None or self._wgrabber.hwnd != self.win.hwnd \
+                    or self._wgrabber.sub != sub:
+                self._wgrabber = capture.WindowGrabber(self.win.hwnd, sub=sub)
+            diff, _fp, img = self._wgrabber.update()
+            # 两条通道的指纹不能混着比，切回来时重置，否则第一帧会假报「变化很大」
+            if self._grabber is not None:
+                self._grabber.reset()
+            if img is not None:
+                # 后门抓到了真画面，那就等于「看得见」：不冻结计时，也不跳 OCR
+                occluded = False
+            else:
+                use_window_grab = False
+        if not use_window_grab:
+            diff, _fp, img = self._grabber.update()
+            if self._wgrabber is not None:
+                self._wgrabber.reset()
+
         if img is not None:
             self.latest_frame = img
         now = time.time()
         changed = diff >= d.change_threshold
 
-        # 3.5) 遮挡检查：窗口被别的窗口盖住时，截到的是上层窗口的内容，
-        #      必须当成「看不见」处理，否则会被外面的文字骗得永不停录。
-        occluded = False
-        if d.detect_occlusion:
-            occluded = not windows.is_region_on_top(self.win.hwnd, bbox)
-            if occluded:
-                if not self._occluded_since:
-                    self._occluded_since = now
-            else:
-                if self._occluded_since:
-                    # 遮挡结束：把遮挡的时长从「静默计时」里扣掉。
-                    # 不然切走两分钟回来，程序会认为剧情已停两分钟，立刻停录。
-                    self._shift_clock(now - self._occluded_since)
-                self._occluded_since = 0.0
+        # 遮挡计时的维护：真正「看不见」才算遮挡
+        if occluded:
+            if not self._occluded_since:
+                self._occluded_since = now
+        else:
+            if self._occluded_since:
+                # 遮挡结束：把遮挡的时长从「静默计时」里扣掉。
+                # 不然切走两分钟回来，程序会认为剧情已停两分钟，立刻停录。
+                self._shift_clock(now - self._occluded_since)
+            self._occluded_since = 0.0
 
         blank = False
-        if img is not None and (self.phase is Phase.RECORDING or changed):
+        # 被遮挡且没走后门时，img 是别人窗口的画面，判黑白毫无意义，跳过
+        if img is not None and (self.phase is Phase.RECORDING or changed) \
+                and (use_window_grab or not occluded):
             blank = capture.Grabber.is_blank(img)
             self._blank_streak = self._blank_streak + 1 if blank else 0
 
-        # 4) 按需 OCR（被遮挡时完全不读，省得读进别人的字）
+        # 4) 按需 OCR。
+        #    「被遮挡」且没走到后台抓图时完全不读——那张图是别人窗口的画面，
+        #    读进来就是外面的文字。走到后台抓图就照常读，那已经是游戏自己的画面。
         text = ""
         has_dialogue = False
         new_line = False
-        if d.ocr and img is not None and not occluded and \
+        can_read = (not occluded) or use_window_grab
+        if d.ocr and img is not None and can_read and \
                 now - self._last_ocr_ts >= d.ocr_interval:
             if changed or now - self._last_ocr_ts >= max(3.0, d.ocr_interval * 3):
                 self._last_ocr_ts = now
@@ -281,12 +356,23 @@ class Detector:
         note = "被遮挡" if occluded else region_desc
         if occluded and self._occluded_since:
             note = f"游戏窗口被遮挡 {int(now - self._occluded_since)}s"
+        elif use_window_grab:
+            note = f"窗口被遮挡·后台抓图中（{region_desc}）"
+        if self.win and windows.is_iconic(self.win.hwnd):
+            note = "⚠ 游戏窗口已最小化，OBS 会录到黑屏"
         self._snap(diff=diff, text=text or self._last_text,
                    region=bbox, note=note)
 
     # ------------------------------------------------------------------ #
     # 自动推进
     # ------------------------------------------------------------------ #
+    def _emit_once_minimized(self) -> None:
+        """最小化只提示一次，别每 0.6 秒刷一条日志。"""
+        if not self._minimized_warned:
+            self._minimized_warned = True
+            self._emit("info", {"message": "游戏窗口已最小化——OBS 抓不到最小化窗口的画面，"
+                                           f"超过 {self.cfg.detect.minimized_timeout:.0f} 秒会停止录制"})
+
     def _maybe_advance(self, now: float, img, text: str, bbox: tuple) -> None:
         adv = self.advancer
         if adv is None or not adv.active:
@@ -470,6 +556,16 @@ class Detector:
                 self._end_segment(StopReason.OCCLUDED)
             return
 
+        # 保护：窗口被最小化。
+        # 最小化时 GetWindowRect 返回 -32000，截屏拿不到游戏画面，
+        # OBS 的窗口采集同样抓不到——继续录只会得到一整段黑屏视频。
+        if self.win and windows.is_iconic(self.win.hwnd):
+            self._minimized_since = self._minimized_since or now
+            if now - self._minimized_since >= d.minimized_timeout:
+                self._end_segment(StopReason.MINIMIZED)
+            return
+        self._minimized_since = 0.0
+
         # 宽限期内不判结束
         if seg_elapsed < d.start_grace:
             return
@@ -488,6 +584,8 @@ class Detector:
     def _begin_segment(self, reason: str) -> None:
         now = time.time()
         self._seg_start_ts = now
+        self._minimized_since = 0.0
+        self._minimized_warned = False
         self._last_progress_ts = now
         self._last_change_ts = now
         self._last_ocr_ts = 0.0
@@ -643,6 +741,9 @@ class Detector:
             self.hwnd = w.hwnd
             self.win = w
             self._grabber = None
+            self._wgrabber = None
+            self._win_grab_ok = None
+            self._win_grab_tried = 0.0
             self._auto_rel = None
             self._emit("window", {"hwnd": w.hwnd, "title": w.title,
                                   "process": w.process, "size": list(w.size)})

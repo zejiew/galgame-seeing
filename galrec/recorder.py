@@ -509,7 +509,8 @@ def _reason_text_s(r: StopReason) -> str:
     return {
         StopReason.IDLE: "剧情结束", StopReason.WINDOW: "窗口关闭",
         StopReason.MAXDUR: "达到单段上限", StopReason.MANUAL: "手动停止",
-        StopReason.OCCLUDED: "窗口被遮挡", StopReason.ERROR: "异常",
+        StopReason.OCCLUDED: "窗口被遮挡", StopReason.MINIMIZED: "窗口被最小化",
+        StopReason.ERROR: "异常",
     }.get(r, str(r))
 
 

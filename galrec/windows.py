@@ -208,6 +208,18 @@ def is_alive(hwnd: int) -> bool:
         return False
 
 
+def is_iconic(hwnd: int) -> bool:
+    """窗口是否处于最小化状态。
+
+    最小化时截图和 OBS 的窗口采集都拿不到画面，必须单独识别出来，
+    否则会一直录黑屏。
+    """
+    try:
+        return bool(win32gui.IsIconic(hwnd))
+    except Exception:
+        return False
+
+
 def screen_size() -> tuple:
     if not _HAS_WIN32:
         return (1920, 1080)

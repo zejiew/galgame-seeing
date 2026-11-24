@@ -57,6 +57,8 @@ class DetectConfig:
     require_dialogue: bool = True     # 开始录制要求画面里确实有台词文字
     detect_occlusion: bool = True     # 检测游戏窗口是否被别的窗口挡住
     occlusion_timeout: float = 180.0  # 被挡住多久算「剧情中断」（0=不因遮挡停）
+    occluded_fallback: bool = True    # 被挡住时改从窗口后台抓图，照常读台词/计时
+    minimized_timeout: float = 30.0   # 窗口最小化多久就停录（最小化必然录到黑屏）
     choice_check: bool = True         # 顺便检测选项界面（自动推进要用）
     choice_check_interval: float = 0.0  # 0=只在需要时查
 
