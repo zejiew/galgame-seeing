@@ -3,9 +3,6 @@
 检测 galgame 剧情在推进还是已经停下，自动控制 OBS 开始/停止录制。
 可选「自动推进」：替你按键推进剧情，遇到选项自动停手。
 
-
-
-
 > 仓库：https://github.com/zejiew/galgame-seeing
 
 ---
