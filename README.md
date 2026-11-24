@@ -5,7 +5,6 @@
 
 
 
-![主界面](docs/screenshots/main.png)
 
 > 仓库：https://github.com/zejiew/galgame-seeing
 
