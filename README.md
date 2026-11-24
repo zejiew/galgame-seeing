@@ -3,9 +3,8 @@
 检测 galgame 剧情在推进还是已经停下，自动控制 OBS 开始/停止录制。
 可选「自动推进」：替你按键推进剧情，遇到选项自动停手。
 
-界面走天蓝渐变 + 二次元风格：卡片式分区、胶囊按钮、圆形头像，右上角一眼看到当前是待机还是录制中。
 
-![主界面](docs/screenshots/main.png)
+
 
 > 仓库：https://github.com/zejiew/galgame-seeing
 
