@@ -239,11 +239,12 @@ class Detector:
                 return
 
         # 2) 最小化处理。
-        #    ⚠ 这里**不能**默认就停录：OBS 的窗口采集 / 游戏采集在窗口最小化后
-        #    往往照样能正常输出画面（DWM 还在合成），替用户把这段掐掉是错的。
-        #    所以默认只在「最小化期间读不到台词」时冻结计时，录制继续。
-        #    真遇到某些引擎最小化后确实只录到黑屏，可以在设置里打开
-        #    stop_on_minimized 恢复旧行为。
+        #    ⚠ 结论（已实测，别再改回去）：窗口最小化后 **Windows 会停止渲染它**，
+        #    OBS 的窗口采集/游戏采集拿不到任何帧，录出来是纯黑。
+        #    实测三种采集方法在最小化时都是 std=0.0（全黑）：
+        #        BitBlt / WGC / 自动  →  全部黑屏
+        #    而「被别的窗口盖住」完全不同：窗口仍在渲染，录出来完全正常。
+        #    所以：最小化 → 停录（录下去只有黑屏）；被遮挡 → 继续录。
         now0 = time.time()
         if self.win and windows.is_iconic(self.win.hwnd):
             if not self._minimized_since:
@@ -253,9 +254,10 @@ class Detector:
             if d2.stop_on_minimized and self.phase is Phase.RECORDING and \
                     now0 - self._minimized_since >= d2.minimized_timeout:
                 self._end_segment(StopReason.MINIMIZED)
-                self._snap(note="游戏窗口最小化超时，已停录")
+                self._snap(note="游戏窗口最小化超时，已停录（最小化时录到的只有黑屏）")
                 return
-            # 先试试走后门抓图：最小化时 PrintWindow 对一部分引擎仍然有效
+            # 没到停录阈值（或用户关掉了这个开关）时：尽量靠后台抓图维持检测，
+            # 这样窗口一恢复就能立刻接着判断，不用重新等剧情起势。
             img_min = None
             if d2.occluded_fallback:
                 if self._win_grab_ok is not True and \
@@ -269,7 +271,6 @@ class Detector:
                     except Exception:
                         img_min = None
             if img_min is not None and not capture.Grabber.is_blank(img_min):
-                # 读得到画面：和正常流程一样读台词、照常计时
                 text = ""
                 if self.cfg.detect.ocr:
                     text = self._read_text(img_min)
@@ -283,17 +284,20 @@ class Detector:
                 elif self.phase is Phase.RECORDING:
                     self._check_end(False, new_line, now0, text, occluded=False)
                 self._snap(text=text or self._last_text,
-                           note="游戏窗口最小化，仍在后台抓图检测（录制不受影响）")
+                           note="游戏窗口最小化（录制中画面会是黑屏），检测走后台抓图")
                 return
-            # 抓不到画面：冻结计时，但**不停录**
+            # 抓不到画面：冻结检测计时，等窗口恢复后从断点继续；
+            # 停录与否完全由上面的 stop_on_minimized 决定。
             self._shift_clock(max(0.0, now0 - (self._last_tick_ts or now0)))
             self._last_tick_ts = now0
-            # 冻结的是「剧情推进」计时，不是安全上限——录太久照旧要收
             if self.phase is Phase.RECORDING and d2.max_record_seconds > 0 and \
                     now0 - (self._seg_wall_start or now0) >= d2.max_record_seconds:
                 self._end_segment(StopReason.MAXDUR)
                 return
-            self._snap(note="游戏窗口已最小化，暂停检测计时（录制继续）")
+            note = ("游戏窗口已最小化，暂停检测计时"
+                    + ("（即将停录，最小化时录到的是黑屏）"
+                       if d2.stop_on_minimized else "（录制继续）"))
+            self._snap(note=note)
             return
         self._minimized_since = 0.0
         self._minimized_warned = False
@@ -427,7 +431,7 @@ class Detector:
         elif use_window_grab:
             note = f"窗口被遮挡·后台抓图中（{region_desc}）"
         if self.win and windows.is_iconic(self.win.hwnd):
-            note = "游戏窗口已最小化（录制继续，检测计时暂停）"
+            note = "游戏窗口已最小化（这段录到的是黑屏）"
         self._snap(diff=diff, text=text or self._last_text,
                    region=bbox, note=note)
 
@@ -439,11 +443,11 @@ class Detector:
         if not self._minimized_warned:
             self._minimized_warned = True
             if self.cfg.detect.stop_on_minimized:
-                msg = ("游戏窗口已最小化——已设置「最小化就停录」，"
-                       f"超过 {self.cfg.detect.minimized_timeout:.0f} 秒会停止录制")
+                msg = ("游戏窗口已最小化——最小化后系统停止渲染该窗口，"
+                       f"OBS 只能录到黑屏，超过 {self.cfg.detect.minimized_timeout:.0f} 秒会停止录制")
             else:
-                msg = ("游戏窗口已最小化。录制**不会**因此停止"
-                       "（OBS 的窗口/游戏采集通常能照常录到画面）")
+                msg = ("游戏窗口已最小化。注意：最小化后系统不再渲染该窗口，"
+                       "OBS 这段录出来会是黑屏（窗口被别的窗口盖住则不受影响）")
             self._emit("info", {"message": msg})
 
     def _maybe_advance(self, now: float, img, text: str, bbox: tuple) -> None:

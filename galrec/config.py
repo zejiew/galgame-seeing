@@ -61,11 +61,11 @@ class DetectConfig:
     detect_occlusion: bool = True     # 检测游戏窗口是否被别的窗口挡住
     occlusion_timeout: float = 180.0  # 被挡住多久算「剧情中断」（0=不因遮挡停）
     occluded_fallback: bool = True    # 被挡住时改从窗口后台抓图，照常读台词/计时
-    # 最小化：默认**不**停录。OBS 的窗口/游戏采集在很多配置下窗口最小化后
-    # 照样能正常出画面，凭什么替用户决定「这段不要了」。
-    # 想恢复旧行为（最小化就停）就把 stop_on_minimized 打开。
-    stop_on_minimized: bool = False
-    minimized_timeout: float = 300.0  # 仅当 stop_on_minimized=True 时生效
+    # 最小化：默认**停录**。实测（BitBlt / WGC / 自动三种方法都一样）：
+    # 窗口最小化后 Windows 停止渲染它，OBS 拿不到任何帧，录出来是纯黑。
+    # 而「被别的窗口盖住」不同——窗口仍在渲染，录出来完全正常，不需要停。
+    stop_on_minimized: bool = True
+    minimized_timeout: float = 20.0   # 最小化多久就停录（录下去只有黑屏）
     choice_check: bool = True         # 顺便检测选项界面（自动推进要用）
     choice_check_interval: float = 0.0  # 0=只在需要时查
 

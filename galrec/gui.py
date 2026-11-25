@@ -491,7 +491,7 @@ class App(tk.Tk):
             (self.v_segmented, "停录后剧情再动时另起一段"),
             (self.v_detect_occ, "检测窗口是否被其它窗口挡住"),
             (self.v_occ_fallback, "被挡住时从窗口后台抓图（多数 galgame 支持）"),
-            (self.v_stop_on_min, "窗口最小化就停止录制（默认关：OBS 通常照样能录）"),
+            (self.v_stop_on_min, "窗口最小化就停止录制（推荐：最小化后系统不再渲染，只能录到黑屏）"),
         ]:
             ttk.Checkbutton(f, text=text, style="Sky.TCheckbutton",
                             variable=var).grid(

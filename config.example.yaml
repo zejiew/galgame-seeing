@@ -33,8 +33,8 @@ detect:
   detect_occlusion: true
   occlusion_timeout: 180.0
   occluded_fallback: true
-  stop_on_minimized: false
-  minimized_timeout: 300.0
+  stop_on_minimized: true
+  minimized_timeout: 20.0
   choice_check: true
   choice_check_interval: 0.0
   region_rel: null

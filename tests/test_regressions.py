@@ -210,16 +210,27 @@ class FakeWindow:
         return (1280, 720)
 
 
-def test_minimize_does_not_stop():
-    print("\n[A] 最小化不该停录")
+def test_minimize_stops_by_default():
+    """A. 最小化必须默认停录。
+
+    实测（BitBlt / WGC / 自动三种方法一致）：窗口最小化后 Windows 停止渲染，
+    OBS 只能录到纯黑。所以「最小化不停录」是错的默认值——
+    它会让录像里塞进一大段黑屏，还占硬盘。
+    """
+    print("\n[A] 最小化必须默认停录（录下去只有黑屏）")
     from galrec.config import Config
     from galrec.detector import Detector, Phase, StopReason
 
-    # ---- A1：模拟 _tick 里「窗口最小化」那一段的行为 ----
+    # ---- A1：默认配置就该停 ----
     cfg = Config()
-    cfg.detect.minimized_timeout = 0.3      # 缩短，方便测
-    cfg.detect.stop_on_minimized = False
+    check("默认 stop_on_minimized = True",
+          cfg.detect.stop_on_minimized is True,
+          f"实际 {cfg.detect.stop_on_minimized}")
+    check("默认 minimized_timeout 是 20 秒量级（不是 300）",
+          0 < cfg.detect.minimized_timeout <= 60,
+          f"{cfg.detect.minimized_timeout}s")
 
+    cfg.detect.minimized_timeout = 0.25     # 缩短方便测
     events = []
     det = Detector(cfg, on_event=lambda e, p: events.append((e, p)))
     det.win = FakeWindow()
@@ -229,38 +240,36 @@ def test_minimize_does_not_stop():
     det._seg_wall_start = time.time() - 10
     det._last_progress_ts = time.time() - 10
 
-    # 让 is_iconic 恒为真、后台抓图恒失败（模拟最小化且抓不到）
     import galrec.detector as detmod
     orig_iconic = detmod.windows.is_iconic
     orig_alive = detmod.windows.is_alive
     orig_find = detmod.windows.find_window
+    orig_probe = detmod.capture.WindowGrabber.probe
     detmod.windows.is_iconic = lambda hwnd: True
     detmod.windows.is_alive = lambda hwnd: True
     detmod.windows.find_window = lambda **kw: FakeWindow()
-    orig_probe = detmod.capture.WindowGrabber.probe
     detmod.capture.WindowGrabber.probe = lambda self: False
     det._win_grab_ok = False
     try:
-        # 连续跑 1.5 秒（远超 0.3 秒阈值）
         t0 = time.time()
-        while time.time() - t0 < 1.5:
+        while time.time() - t0 < 1.2 and det.phase is Phase.RECORDING:
             det._tick()
-            time.sleep(0.1)
+            time.sleep(0.06)
     finally:
         detmod.windows.is_iconic = orig_iconic
         detmod.windows.is_alive = orig_alive
         detmod.windows.find_window = orig_find
         detmod.capture.WindowGrabber.probe = orig_probe
 
-    stops = [p for e, p in events if e == "segment_stop"]
-    check("默认配置：最小化 1.5s（阈值 0.3s）没有触发停录",
-          len(stops) == 0 and det.phase is Phase.RECORDING,
-          f"phase={det.phase.value} stops={stops}")
+    reasons = [p.get("reason") for e, p in events if e == "segment_stop"]
+    check("默认配置下最小化会停录（reason=minimized）",
+          StopReason.MINIMIZED.value in reasons,
+          f"reasons={reasons} phase={det.phase.value}")
 
-    # ---- A2：显式打开开关就该停 ----
+    # ---- A2：用户显式关掉开关，才允许不停 ----
     cfg2 = Config()
+    cfg2.detect.stop_on_minimized = False
     cfg2.detect.minimized_timeout = 0.2
-    cfg2.detect.stop_on_minimized = True
     ev2 = []
     d2 = Detector(cfg2, on_event=lambda e, p: ev2.append((e, p)))
     d2.win = FakeWindow()
@@ -268,27 +277,27 @@ def test_minimize_does_not_stop():
     d2.phase = Phase.RECORDING
     d2._seg_start_ts = time.time() - 5
     d2._seg_wall_start = time.time() - 5
+    d2._win_grab_ok = False
     detmod.windows.is_iconic = lambda hwnd: True
     detmod.windows.is_alive = lambda hwnd: True
     detmod.windows.find_window = lambda **kw: FakeWindow()
     detmod.capture.WindowGrabber.probe = lambda self: False
-    d2._win_grab_ok = False
     try:
         t0 = time.time()
-        while time.time() - t0 < 1.0 and d2.phase is Phase.RECORDING:
+        while time.time() - t0 < 1.0:
             d2._tick()
-            time.sleep(0.08)
+            time.sleep(0.06)
     finally:
         detmod.windows.is_iconic = orig_iconic
         detmod.windows.is_alive = orig_alive
         detmod.windows.find_window = orig_find
         detmod.capture.WindowGrabber.probe = orig_probe
-    r2 = [p.get("reason") for e, p in ev2 if e == "segment_stop"]
-    check("打开「最小化就停录」后确实会停（旧行为可恢复）",
-          StopReason.MINIMIZED.value in r2, f"reasons={r2}")
+    stops2 = [p for e, p in ev2 if e == "segment_stop"]
+    check("关掉开关后最小化不停（保留给特殊场景）",
+          len(stops2) == 0 and d2.phase is Phase.RECORDING,
+          f"stops={stops2} phase={d2.phase.value}")
 
-    # ---- A3：最小化期间静默计时要被冻结 ----
-    # 直接测冻结用的时钟平移：只推 seconds，不能多推
+    # ---- A3：静默计时的时钟平移只推指定秒数 ----
     cfg3 = Config()
     d3 = Detector(cfg3)
     now = time.time()
@@ -622,7 +631,7 @@ def main() -> int:
     print("=" * 62)
     print(" Galgame 录制 · 回归测试（最小化 / 停录灵敏性）")
     print("=" * 62)
-    test_minimize_does_not_stop()
+    test_minimize_stops_by_default()
     test_stop_501_is_not_failure()
     test_start_verified()
     test_stop_slow_does_not_timeout()
