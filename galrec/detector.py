@@ -43,7 +43,9 @@ class StopReason(str, Enum):
     MAXDUR = "max_duration"
     MANUAL = "manual"
     OCCLUDED = "occluded"      # 窗口被遮住太久
-    MINIMIZED = "minimized"    # 窗口被最小化（OBS 抓不到，只会录到黑屏）
+    MINIMIZED = "minimized"    # 窗口被最小化（仅在 stop_on_minimized 打开时）
+    TITLE = "title"            # 画面回到标题/主菜单
+    TEXT_LOST = "text_lost"    # 台词框长时间一个可读的字都没有
     ERROR = "error"
 
 
@@ -106,6 +108,7 @@ class Detector:
         self._phase_ts = time.time()
         self._segment_start_text = ""
         self._last_stop_text = ""
+        self._last_stop_ts = 0.0
         self._change_streak = 0
         self._no_text_ticks = 0
         self._segments = 0
@@ -113,6 +116,10 @@ class Detector:
         self._occluded_since = 0.0
         self._minimized_since = 0.0
         self._minimized_warned = False
+        self._last_tick_ts = 0.0
+        self._last_dialogue_ts = 0.0
+        self._seg_wall_start = 0.0
+        self._title_hits = 0
         self._auto_try_ts = 0.0
         self._idle = 0.0
         self._last_snap = Snapshot()
@@ -179,6 +186,21 @@ class Detector:
         if self.phase is Phase.RECORDING:
             self._end_segment(StopReason.MANUAL)
 
+    def abort_segment(self) -> None:
+        """开录失败时用：把段落状态退回「等剧情开始」，**不**抛 segment_stop。
+
+        不能走 force_stop()：那会抛一条 segment_stop，上层又去发一次 StopRecord，
+        而 OBS 压根没开始录 → 白白撞一次 501，日志里还会多出一条「停录」。
+        """
+        if self.phase is not Phase.RECORDING:
+            return
+        self.phase = Phase.ARMED if self.hwnd else Phase.IDLE
+        self._phase_ts = time.time()
+        self._seg_start_ts = 0.0
+        self._seg_wall_start = 0.0
+        self._last_stop_ts = time.time()
+        self._emit("phase", {"phase": self.phase.value, "note": "开录失败，已退回待命"})
+
     def pause_armed(self) -> None:
         """暂停监控（不移除窗口）。"""
         if self.phase is not Phase.RECORDING:
@@ -216,20 +238,66 @@ class Detector:
                 self._set_phase(Phase.IDLE, note="窗口已关闭")
                 return
 
-        # 2) 最小化检查必须放在「算采样区域」之前。
-        #    窗口最小化时 GetWindowRect 会给 -32000，区域算不出来会直接 return，
-        #    那样 _check_end 永远跑不到，就会一直录黑屏。
+        # 2) 最小化处理。
+        #    ⚠ 这里**不能**默认就停录：OBS 的窗口采集 / 游戏采集在窗口最小化后
+        #    往往照样能正常输出画面（DWM 还在合成），替用户把这段掐掉是错的。
+        #    所以默认只在「最小化期间读不到台词」时冻结计时，录制继续。
+        #    真遇到某些引擎最小化后确实只录到黑屏，可以在设置里打开
+        #    stop_on_minimized 恢复旧行为。
         now0 = time.time()
         if self.win and windows.is_iconic(self.win.hwnd):
             if not self._minimized_since:
                 self._minimized_since = now0
             self._emit_once_minimized()
-            if self.phase is Phase.RECORDING:
-                if now0 - self._minimized_since >= d.minimized_timeout:
-                    self._end_segment(StopReason.MINIMIZED)
-            self._snap(note="⚠ 游戏窗口已最小化，OBS 会录到黑屏")
+            d2 = self.cfg.detect
+            if d2.stop_on_minimized and self.phase is Phase.RECORDING and \
+                    now0 - self._minimized_since >= d2.minimized_timeout:
+                self._end_segment(StopReason.MINIMIZED)
+                self._snap(note="游戏窗口最小化超时，已停录")
+                return
+            # 先试试走后门抓图：最小化时 PrintWindow 对一部分引擎仍然有效
+            img_min = None
+            if d2.occluded_fallback:
+                if self._win_grab_ok is not True and \
+                        (self._win_grab_ok is None or
+                         now0 - self._win_grab_tried >= 60.0):
+                    self._win_grab_tried = now0
+                    self._win_grab_ok = capture.WindowGrabber(self.win.hwnd).probe()
+                if self._win_grab_ok:
+                    try:
+                        img_min = capture.WindowGrabber(self.win.hwnd).grab()
+                    except Exception:
+                        img_min = None
+            if img_min is not None and not capture.Grabber.is_blank(img_min):
+                # 读得到画面：和正常流程一样读台词、照常计时
+                text = ""
+                if self.cfg.detect.ocr:
+                    text = self._read_text(img_min)
+                has_dlg = len(ocr.normalize(text)) >= self.cfg.detect.dialogue_min_chars
+                new_line = self._merge_line(text, now0) if has_dlg else False
+                if has_dlg:
+                    self._no_text_ticks = 0
+                self.latest_frame = img_min
+                if self.phase in (Phase.ARMED, Phase.COOLDOWN):
+                    self._maybe_begin(False, has_dlg, new_line, img_min, "最小化·后台抓图")
+                elif self.phase is Phase.RECORDING:
+                    self._check_end(False, new_line, now0, text, occluded=False)
+                self._snap(text=text or self._last_text,
+                           note="游戏窗口最小化，仍在后台抓图检测（录制不受影响）")
+                return
+            # 抓不到画面：冻结计时，但**不停录**
+            self._shift_clock(max(0.0, now0 - (self._last_tick_ts or now0)))
+            self._last_tick_ts = now0
+            # 冻结的是「剧情推进」计时，不是安全上限——录太久照旧要收
+            if self.phase is Phase.RECORDING and d2.max_record_seconds > 0 and \
+                    now0 - (self._seg_wall_start or now0) >= d2.max_record_seconds:
+                self._end_segment(StopReason.MAXDUR)
+                return
+            self._snap(note="游戏窗口已最小化，暂停检测计时（录制继续）")
             return
         self._minimized_since = 0.0
+        self._minimized_warned = False
+        self._last_tick_ts = now0
 
         # 3) 确定采样区域
         bbox, region_desc = self._resolve_bbox()
@@ -359,7 +427,7 @@ class Detector:
         elif use_window_grab:
             note = f"窗口被遮挡·后台抓图中（{region_desc}）"
         if self.win and windows.is_iconic(self.win.hwnd):
-            note = "⚠ 游戏窗口已最小化，OBS 会录到黑屏"
+            note = "游戏窗口已最小化（录制继续，检测计时暂停）"
         self._snap(diff=diff, text=text or self._last_text,
                    region=bbox, note=note)
 
@@ -370,8 +438,13 @@ class Detector:
         """最小化只提示一次，别每 0.6 秒刷一条日志。"""
         if not self._minimized_warned:
             self._minimized_warned = True
-            self._emit("info", {"message": "游戏窗口已最小化——OBS 抓不到最小化窗口的画面，"
-                                           f"超过 {self.cfg.detect.minimized_timeout:.0f} 秒会停止录制"})
+            if self.cfg.detect.stop_on_minimized:
+                msg = ("游戏窗口已最小化——已设置「最小化就停录」，"
+                       f"超过 {self.cfg.detect.minimized_timeout:.0f} 秒会停止录制")
+            else:
+                msg = ("游戏窗口已最小化。录制**不会**因此停止"
+                       "（OBS 的窗口/游戏采集通常能照常录到画面）")
+            self._emit("info", {"message": msg})
 
     def _maybe_advance(self, now: float, img, text: str, bbox: tuple) -> None:
         adv = self.advancer
@@ -442,15 +515,21 @@ class Detector:
     # 台词合并（对付打字机）
     # ------------------------------------------------------------------ #
     def _shift_clock(self, seconds: float) -> None:
-        """把所有「时间戳」往前推，等价于把这段时间从计时里抹掉。"""
+        """把所有「时间戳」往前推，等价于把这段时间从计时里抹掉。
+
+        ⚠ 只推 seconds，绝不能多推（旧版多推了 0.5 秒）：
+        遮挡抖动时会一秒一次地反复进出这个分支，每次都多推 0.5 秒，
+        累计几分钟后 `_last_progress_ts` 就被推到未来去了，
+        `idle = now - _last_progress_ts` 永远小于阈值——于是**剧情早就结束
+        （甚至已经回到标题）却永远不停录**。
+        """
         if seconds <= 0:
             return
-        eps = seconds + 0.5
         for attr in ("_last_progress_ts", "_last_text_ts", "_seg_start_ts",
-                     "_last_change_ts"):
+                     "_last_change_ts", "_last_dialogue_ts"):
             v = getattr(self, attr, 0.0)
             if v:
-                setattr(self, attr, v + eps)
+                setattr(self, attr, v + seconds)
 
     def _merge_line(self, text: str, now: float) -> bool:
         """判断这次读到的是「新的一句」还是「同一句的更多字」。
@@ -464,6 +543,7 @@ class Detector:
         """
         cur = ocr.normalize(text)
         best = ocr.normalize(self._burst_best)
+        self._last_dialogue_ts = now      # 「最后一次确实读到台词」的时刻
         if not self._last_text:
             self._burst_best = text
             self._last_text = text
@@ -526,9 +606,16 @@ class Detector:
             # 刚停录的那句话不能立刻触发重开，否则会在原地反复起停
             if self._last_stop_text and ocr.similarity(self._last_stop_text, self._last_text) > 0.85:
                 return
+            # 停录后的冷却期：回标题画面时 UI 一抖就重新开录，会切出一堆废片
+            cd = float(self.cfg.detect.cooldown_seconds or 0)
+            if cd > 0 and time.time() - (self._last_stop_ts or 0) < cd:
+                return
             self._begin_segment(reason="dialogue")
         else:
             if changed and self._change_streak >= max(1, d.confirm_ticks):
+                cd = float(self.cfg.detect.cooldown_seconds or 0)
+                if cd > 0 and time.time() - (self._last_stop_ts or 0) < cd:
+                    return
                 self._begin_segment(reason="activity")
 
     # ------------------------------------------------------------------ #
@@ -537,14 +624,16 @@ class Detector:
     def _check_end(self, changed: bool, new_line: bool, now: float, text: str,
                    occluded: bool = False) -> None:
         d = self.cfg.detect
-        seg_elapsed = now - self._seg_start_ts
+        seg_elapsed = now - (self._seg_wall_start or self._seg_start_ts)
 
         # 保护：最长录制时长
         if d.max_record_seconds > 0 and seg_elapsed >= d.max_record_seconds:
             self._end_segment(StopReason.MAXDUR)
             return
 
-        # 保护：窗口画面全黑（被最小化/切走）太久
+        # 保护：窗口画面全黑太久。
+        # 注意这条只看「录到的是不是纯色画面」，和「最小化」是两件事：
+        # 最小化在 _tick 里已经单独处理（默认不停录）。
         if self._blank_streak >= 30:
             self._end_segment(StopReason.WINDOW)
             return
@@ -556,27 +645,115 @@ class Detector:
                 self._end_segment(StopReason.OCCLUDED)
             return
 
-        # 保护：窗口被最小化。
-        # 最小化时 GetWindowRect 返回 -32000，截屏拿不到游戏画面，
-        # OBS 的窗口采集同样抓不到——继续录只会得到一整段黑屏视频。
-        if self.win and windows.is_iconic(self.win.hwnd):
-            self._minimized_since = self._minimized_since or now
-            if now - self._minimized_since >= d.minimized_timeout:
-                self._end_segment(StopReason.MINIMIZED)
-            return
-        self._minimized_since = 0.0
-
         # 宽限期内不判结束
         if seg_elapsed < d.start_grace:
             return
+
+        # 「只手动停」：除了硬性安全阀（单段上限/窗口没了/画面全黑），
+        # 一律不许自动停。这个选项以前在界面上有、代码里压根没读，等于假的。
+        manual_only = (self.cfg.record.stop_mode == "manual")
 
         # 结束判定只看「有没有新台词」。
         # 像素变化不能作为推进信号——动态背景、Live2D 呼吸、UI 闪烁一直在动，
         # 一旦把「画面在动」当成剧情推进，就永远不会停录。像素只用来决定要不要 OCR。
         idle = now - self._last_progress_ts
-        self._idle = idle
-        if d.idle_timeout > 0 and idle >= d.idle_timeout:
+        # 防御：时间戳被推到未来（历史上的 _shift_clock 重复加 eps 就会这样）
+        # 会让 idle 变成负数、永远到不了阈值。发现就当成「刚刚才推进过」，
+        # 让计时从现在重新开始，而不是一直卡着不停录。
+        if idle < -1.0:
+            self._last_progress_ts = now
+            self._last_text_ts = min(self._last_text_ts or now, now)
+            self._seg_start_ts = min(self._seg_start_ts, now)
+            self._emit("info", {"message": "检测到计时时钟漂移（时间戳超出当前时刻），"
+                                           "已自动校正"})
+            idle = 0.0
+        self._idle = max(0.0, idle)
+
+        # 台词框长时间一个字都读不到：多半是回到了标题/主菜单/纯 CG 过场。
+        # 这条比 idle_timeout 敏感得多，解决「剧情结束、甚至回到标题了还在录」。
+        if not manual_only and self.cfg.record.auto_stop_on_title and \
+                self._last_dialogue_ts and d.text_lost_timeout > 0 and \
+                now - self._last_dialogue_ts >= d.text_lost_timeout:
+            self._end_segment(StopReason.TEXT_LOST)
+            return
+
+        # 回到标题/主菜单：不必等 idle 超时，直接停。
+        # 只在「冷静了一会儿」之后才跑整窗 OCR，避免录制中每帧都花 1 秒。
+        if not manual_only and self.cfg.record.auto_stop_on_title:
+            probe_after = min(max(20.0, d.idle_timeout * 0.35),
+                              max(20.0, d.idle_timeout - 10.0)) \
+                if d.idle_timeout > 0 else 20.0
+            if self._idle >= probe_after and self._title_check_due(now):
+                if self._looks_like_title_screen():
+                    self._end_segment(StopReason.TITLE)
+                    return
+
+        if manual_only:
+            return
+        if d.idle_timeout > 0 and self._idle >= d.idle_timeout:
             self._end_segment(StopReason.IDLE)
+
+    # ------------------------------------------------------------------ #
+    # 标题 / 主菜单识别
+    # ------------------------------------------------------------------ #
+    #: 标题画面常见的菜单词（中/日/英三套，galgame 基本跑不出这些）
+    _TITLE_WORDS = (
+        "开始游戏", "新游戏", "新的游戏", "继续游戏", "继续", "载入", "读取存档",
+        "加载存档", "存档", "退出游戏", "退出", "设置", "设定", "配置", "画廊",
+        "鉴赏", "回想", "额外内容", "特典", "安装",
+        "NEW GAME", "NEWGAME", "START", "CONTINUE", "LOAD", "SAVE",
+        "CONFIG", "SETTINGS", "OPTIONS", "EXTRA", "GALLERY", "EXIT", "QUIT",
+        "はじめから", "つづきから", "ろーど", "ロード", "コンフィグ",
+        "せってい", "おまけ", "ギャラリー", "しゅうりょう", "タイトルへ",
+    )
+
+    def _title_check_due(self, now: float) -> bool:
+        """整窗 OCR 很贵（0.5~1.5 秒），限制频率。"""
+        last = getattr(self, "_title_check_ts", 0.0)
+        if now - last < 4.0:
+            return False
+        self._title_check_ts = now
+        return True
+
+    def _looks_like_title_screen(self) -> bool:
+        """判断当前画面是不是标题/主菜单。
+
+        依据：整窗里出现 ≥2 个「菜单词」，且这些词都比较短（菜单项不会是一长句），
+        并且对话框区域里没有台词。三条同时成立才判——宁可漏判也不能误判，
+        误判会在剧情中途把录像掐断。
+        """
+        if self._occluded_since or not self.win:
+            return False
+        try:
+            cl = windows.client_rect(self.win.hwnd)
+            img = capture.Grabber(cl).grab()
+            if img is None or capture.Grabber.is_blank(img):
+                return False
+            lines = ocr.recognize(img, min_conf=max(0.5, self.cfg.detect.ocr_min_conf))
+            if not lines:
+                return False
+            hits = set()
+            for l in lines:
+                core = ocr.normalize(l.text).upper()
+                if not core or len(core) > 24:
+                    continue        # 菜单项都很短
+                for w in self._TITLE_WORDS:
+                    if ocr.normalize(w).upper() and ocr.normalize(w).upper() in core:
+                        hits.add(w)
+            # 对话框里还有台词 → 是在剧情里，不是标题
+            if self._grabber is not None:
+                gb = self._grabber.bbox
+                sub = (gb[0] - cl[0], gb[1] - cl[1], gb[2] - cl[0], gb[3] - cl[1])
+                if sub[2] - sub[0] > 4 and sub[3] - sub[1] > 4:
+                    box = img.crop(sub)
+                    dlg = ocr.dialogue_text(
+                        ocr.recognize(box, min_conf=self.cfg.detect.ocr_min_conf),
+                        min_conf=self.cfg.detect.ocr_min_conf)
+                    if len(ocr.normalize(dlg)) >= self.cfg.detect.dialogue_min_chars:
+                        return False
+            return len(hits) >= 2
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ #
     # 段落起停
@@ -584,10 +761,12 @@ class Detector:
     def _begin_segment(self, reason: str) -> None:
         now = time.time()
         self._seg_start_ts = now
+        self._seg_wall_start = now      # 真实墙钟起点（不被 _shift_clock 影响，单段上限用）
         self._minimized_since = 0.0
         self._minimized_warned = False
         self._last_progress_ts = now
         self._last_change_ts = now
+        self._last_dialogue_ts = now
         self._last_ocr_ts = 0.0
         self._blank_streak = 0
         self._occluded_since = 0.0
@@ -602,8 +781,12 @@ class Detector:
 
     def _end_segment(self, reason: StopReason) -> None:
         now = time.time()
+        if self.phase is not Phase.RECORDING:
+            # 已经不是录制中了：重复的结束事件不该再发一遍（会触发重复 StopRecord → 501）
+            return
         dur = now - self._seg_start_ts
         self._last_stop_text = self._last_text
+        self._last_stop_ts = now
         self._set_phase(Phase.COOLDOWN if self.cfg.detect.segmented else Phase.IDLE)
         self._emit("segment_stop", {
             "reason": reason.value, "duration": round(dur, 1),

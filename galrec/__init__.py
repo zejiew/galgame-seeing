@@ -12,4 +12,4 @@ recorder   总调度：检测 + 控制 OBS 录制 + 文件命名
 gui        tkinter 图形界面
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

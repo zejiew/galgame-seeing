@@ -12,6 +12,8 @@ obs:
   set_record_dir: true
   scene: ''
   stop_delay: 2.0
+  stop_timeout: 20.0
+  restart_gap: 3.0
 detect:
   window_title: ''
   process_name: ''
@@ -25,10 +27,14 @@ detect:
   confirm_ticks: 2
   settle_frames: 2
   text_lost_timeout: 0.0
+  cooldown_seconds: 5.0
   segmented: true
   require_dialogue: true
   detect_occlusion: true
   occlusion_timeout: 180.0
+  occluded_fallback: true
+  stop_on_minimized: false
+  minimized_timeout: 300.0
   choice_check: true
   choice_check_interval: 0.0
   region_rel: null
@@ -41,6 +47,7 @@ detect:
 record:
   start_mode: on_dialogue
   stop_mode: on_end
+  auto_stop_on_title: true
   pause_when_unfocused: false
   unfocus_grace: 90.0
   filename_template: '{game}_{time}'

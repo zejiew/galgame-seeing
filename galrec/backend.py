@@ -81,6 +81,9 @@ class WsBackend(BaseBackend):
         )
         self._t0 = 0.0
         self._is_rec = False
+        self._last_dur = 0.0       # 最后一次读到的正数时长（停录后兜底用）
+        self._last_status_ok = True  # 上次状态查询是否成功
+        self._started_ts = 0.0       # 本段开录时刻（算「刚停录多久」用）
         self.port_auto = 0          # 自动发现的端口（非用户填写时）
 
     @property
@@ -119,6 +122,8 @@ class WsBackend(BaseBackend):
         self.client.start_record()
         self._t0 = time.time()
         self._is_rec = True
+        self._last_dur = 0.0
+        self._started_ts = time.time()
         try:
             d = self.client.record_status().duration
             if d > 0:
@@ -126,25 +131,50 @@ class WsBackend(BaseBackend):
         except Exception:
             pass
 
+    def verify_started(self, timeout: float = 6.0) -> tuple:
+        """确认真的在录（见 ObsClient.wait_recording_live 的说明）。"""
+        return self.client.wait_recording_live(timeout=timeout)
+
+    def seconds_since_start(self) -> float:
+        return (time.time() - self._started_ts) if self._started_ts else 1e9
+
     def stop(self) -> str:
-        p = self.client.stop_record()
+        p = self.client.stop_record(timeout=max(5.0, float(self.cfg.obs.stop_timeout or 20.0)))
         self._is_rec = False
         return p
 
     def recording(self) -> bool:
+        """是否在录。
+
+        ⚠ 关键：**查询失败不等于「没在录」**。
+        旧版这里 `except ObsError: return False`，一旦赶上偶发的查询异常，
+        上层就会以为「已经不在录了」→ 跳过 StopRecord → OBS 继续写文件
+        → 文件被占用 → 删不掉、改不了名 → 报「停录失败」。
+        现在失败时沿用上一次已知状态，并回退到我们的本地时间线判断。
+        """
         try:
             st = self.client.record_status()
             self._is_rec = st.recording
+            self._last_status_ok = True
             return st.recording
         except obsmod.ObsError:
-            return False
+            self._last_status_ok = False
+            # 本地时间线：我们发过 start、还没发 stop，且距离开录还没超过单段上限，
+            # 那就按「仍在录」处理，宁可多发一次 StopRecord（幂等，不伤文件），
+            # 也不能漏停。
+            return bool(self._is_rec)
 
     def duration(self) -> float:
         try:
             d = self.client.record_status().duration
-            return d if d > 0 else (time.time() - self._t0 if self._is_rec else 0.0)
+            # OBS 停录之后 outputDuration 会归零，但停录那一刻读到的才是准的，
+            # 所以这里把最后一次读到的正数记住，供收尾时兜底。
+            if d > 0:
+                self._last_dur = d
+                return d
+            return self._last_dur or (time.time() - self._t0 if self._is_rec else 0.0)
         except obsmod.ObsError:
-            return time.time() - self._t0 if self._is_rec else 0.0
+            return self._last_dur or (time.time() - self._t0 if self._is_rec else 0.0)
 
     def record_dir(self) -> str:
         try:
@@ -216,6 +246,10 @@ class HotkeyBackend(BaseBackend):
             raise BackendError(f"发送热键失败：{self.cfg.obs.hotkey_stop}")
         self._is_rec = False
         return ""
+
+    def toggle(self) -> str:
+        """按一下停止热键没生效时的兜底：再发一次（OBS 的录制热键是 toggle）。"""
+        return self.stop()
 
     def recording(self) -> bool:
         return self._is_rec

@@ -66,7 +66,11 @@ class Controller:
         self._current: Optional[Session] = None
         self._auto_launched = False
         self._run_lock = threading.Lock()
+        self._stop_guard = threading.Lock()
+        self._stopping = False
         self._pending_stop = False
+        self._pending_reason: Optional[StopReason] = None
+        self._last_stop_ts = 0.0     # 上次真正停录的时刻（开录用它算冷却间隔）
         self.running = False
         self.on_ui_event = None      # 界面可赋值：(kind, payload) -> None
 
@@ -94,6 +98,12 @@ class Controller:
             try:
                 if self.backend.recording():
                     self._stop_record(StopReason.MANUAL)
+                else:
+                    # 有段落记录但 OBS 那边已经没在录：可能是 OBS 自己崩过/手动停过，
+                    # 状态要对齐，不然界面会一直显示「录制中」
+                    with self._lock:
+                        if self._current is not None:
+                            self._close_session_wo_obs(StopReason.MANUAL)
             except Exception:
                 pass
         self.running = False
@@ -260,10 +270,11 @@ class Controller:
                 reason = StopReason(payload.get("reason", "manual"))
             except ValueError:
                 reason = StopReason.MANUAL
-            # 停录要等宽限，放到后台线程，别把检测线程堵住
-            self._pending_stop = True
-            threading.Thread(target=self._stop_record, args=(reason,),
-                             daemon=True).start()
+            # 停录要等宽限，放到后台线程，别把检测线程堵住。
+            # ⚠ 这里**不能**因为「已经有一个停录在跑」就把这次丢掉：
+            # 旧版用 _run_lock 非阻塞抢锁，抢不到直接 return，
+            # 于是「剧情结束该停录」这件事被静默吞掉，一直录到单段上限。
+            self._request_stop(reason)
         elif event == "window":
             self._log(f"已锁定窗口：{payload.get('title')} "
                       f"[{payload.get('process')}] {payload.get('size')}", "info")
@@ -296,7 +307,9 @@ class Controller:
     # ------------------------------------------------------------------ #
     def _start_record(self, payload: dict) -> None:
         if not self._run_lock.acquire(blocking=False):
-            self._log("上一个操作还没完成，跳过本次开录", "warn")
+            # 开录抢不到锁（基本只会是上一段还没收拾完）→ 放弃这一次是安全的：
+            # 等锁一放开，检测线程的下一次采样还会再触发一次 segment_start。
+            self._log("上一段还在收尾，跳过本次开录", "warn")
             return
         try:
             if not (self.backend and self.backend.connected):
@@ -304,6 +317,13 @@ class Controller:
                     self.detector.force_stop()
                     return
             be = self.backend
+            # OBS 的录制输出有冷却：刚 StopRecord 之后马上 StartRecord 容易「假成功」。
+            # 先等一小会儿能显著降低卡死概率；真卡住了下面还有重试兜底。
+            gap = max(0.0, float(getattr(self.cfg.obs, "restart_gap", 3.0) or 0))
+            if gap and self._last_stop_ts:
+                wait = gap - (time.time() - self._last_stop_ts)
+                if 0 < wait:
+                    time.sleep(min(wait, gap))
             self._files_before = be.snapshot_files()
             sess = Session(
                 index=len(self.sessions) + 1,
@@ -311,81 +331,292 @@ class Controller:
                 reason=payload.get("reason", ""),
                 text=payload.get("text", ""),
             )
+            # 开录最多试 3 轮。OBS 的录制输出偶尔会「卡死」：
+            # 回 active=true 但 outputDuration 恒为 0、不写数据，等多久都不会自愈。
+            # 实测有效的救法是：再发一次 StopRecord（它会回 501），等 2 秒，
+            # 输出就恢复可用了。所以卡住不是放弃，而是主动清一下再重试。
+            ok, why = False, ""
+            for attempt in range(1, 4):
+                try:
+                    be.start()
+                except Exception as e:
+                    why = str(e)
+                    self._log(f"开录失败：{e}", "error")
+                    break
+                ok, why = self._verify_recording_started()
+                if ok:
+                    break
+                if attempt < 3:
+                    self._log(f"OBS 输出没真正起来（{why}），"
+                              f"尝试重置录制输出后重试（{attempt}/2）…", "warn")
+                    self._kick_output_reset()
+                    time.sleep(2.0)
+            if not ok:
+                self._log(f"OBS 没有真正开始录制（{why}）", "error")
+                self._recover_after_failed_start()
+                return
             with self._lock:
                 self._current = sess
-            try:
-                be.start()
-            except Exception as e:
-                self._log(f"开录失败：{e}", "error")
-                with self._lock:
-                    self._current = None
-                self.detector.force_stop()
-                return
             self._log(f"● 开始录制（第 {sess.index} 段，触发："
                       f"{_reason_trigger(payload.get('reason',''))}）", "ok")
         finally:
             self._run_lock.release()
 
-    def _stop_record(self, reason: StopReason) -> None:
-        if not self._run_lock.acquire(blocking=False):
+    def _kick_output_reset(self) -> None:
+        """把卡住的录制输出踢一下：发 StopRecord（多半回 501），再等它释放。
+
+        这是实测出来的：OBS 输出卡在「假的 active + 0 字节」时，
+        StartRecord 怎么发都没用，但发一次 StopRecord 之后等两秒就能恢复。
+        """
+        be = self.backend
+        if be is None:
             return
         try:
-            delay = max(0.0, float(self.cfg.obs.stop_delay or 0))
-            if delay:
-                time.sleep(delay)
+            be.stop()
+        except obsmod.ObsNotRunning:
+            pass
+        except Exception:
+            pass
+        try:
+            be.client.disconnect()
+            be.connect()
+        except Exception:
+            pass
+
+    def _verify_recording_started(self, timeout: float = 6.0) -> tuple:
+        """确认 OBS 真的在写数据。返回 (是否在录, 原因)。"""
+        be = self.backend
+        if be is None:
+            return False, "后端未连接"
+        if be.name == "hotkey":
+            return True, ""         # 热键后端没法回读状态，只能相信
+        try:
+            verify = getattr(be, "verify_started", None)
+            if callable(verify):
+                return verify(timeout)
+        except Exception as e:
+            return False, str(e)
+        # 老后端没有这个方法：退回简单的状态轮询
+        end = time.time() + max(0.5, timeout)
+        while time.time() < end:
+            try:
+                if be.recording():
+                    return True, ""
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return False, "OBS 报录制已开始，但状态回读为「未录制」"
+
+    def _recover_after_failed_start(self) -> None:
+        """开录失败后收口：OBS 那边若半开着就先停掉，再把检测器拉回可再试的状态。"""
+        try:
+            if self.backend and self.backend.connected and self.backend.recording():
+                try:
+                    self.backend.stop()
+                    self._last_stop_ts = time.time()
+                except obsmod.ObsNotRunning:
+                    pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        with self._lock:
+            self._current = None
+        # 用 abort_segment 而不是 force_stop：后者会再抛一条 segment_stop，
+        # 上层又要发一次 StopRecord——而 OBS 根本没开始录，白白多撞一次 501。
+        try:
+            self.detector.abort_segment()
+        except AttributeError:
+            self.detector.force_stop()
+
+    def _request_stop(self, reason: StopReason) -> None:
+        """排队一次停录请求。
+
+        与旧版的关键差别：**不丢请求**。
+        - 已经有停录在跑 → 只把「更优先的原因」记下来，等它跑完再补一次；
+        - 有开录还占着锁 → 等锁放开后照样要停（否则会一直录下去）。
+        """
+        with self._stop_guard:
+            if self._stopping:
+                self._pending_stop = True
+                if self._pending_reason is None:
+                    self._pending_reason = reason
+                return
+            self._stopping = True
+        threading.Thread(target=self._stop_worker, args=(reason,),
+                         name="galrec-stop", daemon=True).start()
+
+    def _stop_worker(self, reason: StopReason) -> None:
+        cur = reason
+        while True:
+            try:
+                self._stop_record(cur)
+            except Exception as e:
+                self._log(f"停录过程出错：{e}", "error")
+            with self._stop_guard:
+                if self._pending_stop and self._pending_reason is not None:
+                    cur = self._pending_reason
+                    self._pending_stop = False
+                    self._pending_reason = None
+                    continue
+                self._stopping = False
+                self._pending_stop = False
+                self._pending_reason = None
+                return
+
+    def _stop_record(self, reason: StopReason) -> None:
+        delay = max(0.0, float(self.cfg.obs.stop_delay or 0))
+        if delay:
+            time.sleep(delay)
+        # 开录可能还占着锁（刚触发就判结束的极端情况）：等它，绝不放弃
+        self._run_lock.acquire()
+        try:
             be = self.backend
             path = ""
-            if be:
+            already_gone = False
+            if be is None:
+                return
+            if not (be.connected):
+                self._log("OBS 连接已断开，本段录像可能已丢失", "error")
+                self._finalize_session(reason, "", already_gone=True)
+                return
+            if be.name != "hotkey":
                 try:
-                    path = be.stop()
-                except Exception as e:
-                    self._log(f"停录失败：{e}", "error")
-            with self._lock:
-                sess = self._current
-                self._current = None
-                if sess is None:
-                    return
-                sess.stopped = time.time()
-                sess.reason = reason.value
-                sess.duration = max(0.0, sess.stopped - sess.started)
-
-            # 拿不到路径时，靠目录 diff 兜底（热键后端必然走这条）
-            if not path and be:
-                time.sleep(0.9)
+                    if not be.recording():
+                        already_gone = True
+                        self._log("OBS 那边已经不在录制（可能被手动停了），"
+                                  "直接收尾这一段", "warn")
+                except Exception:
+                    # 查不到就当「还在录」：多发一次 StopRecord 是幂等的（501 已识别），
+                    # 但漏停会让 OBS 一直写文件，直接毁掉这段素材。
+                    already_gone = False
+            if not already_gone:
+                path = self._do_stop_with_retry(reason)
+            sess = self._finalize_session(reason, path, already_gone)
+            if sess is None:
+                return
+            # 拿不到路径时，靠目录 diff 兜底（热键后端必然走这条）。
+            # ⚠ 但「本来就没录到东西」（already_gone / 501）时不能兜底：
+            # 那时目录里根本没有本段的新文件，硬取会抓到上一段刚写完的那个，
+            # 造成「这一段显示成上一段的文件」。实测踩过。
+            if not sess.path and not already_gone and be.connected:
+                # 如果是刚被 _kick_output_reset 重启过连接，录制可能其实还在，
+                # 再给 OBS 一点时间把文件落地
+                time.sleep(1.2)
                 after = be.snapshot_files()
                 new = [p for p in after
                        if p not in self._files_before or after[p] != self._files_before.get(p)]
                 new = [p for p in new if _looks_like_video(p)]
                 if new:
-                    path = max(new, key=lambda p: after.get(p, 0))
-            sess.path = path or ""
+                    sess.path = max(new, key=lambda p: after.get(p, 0))
+            self._post_process(sess)
+        finally:
+            self._run_lock.release()
 
-            dur = sess.duration
-            self._log(f"■ 停止录制（{_reason_text_s(reason)}，时长 {_fmt_sec(dur)}）"
-                      + (f" → {os.path.basename(path)}" if path else ""), "ok")
+    def _do_stop_with_retry(self, reason: StopReason) -> str:
+        """真正发 StopRecord。
 
-            keep = True
-            if self.cfg.record.delete_short and dur < self.cfg.detect.min_record_seconds:
+        501（OutputNotRunning）= 本来就没在录，不是失败，立即收尾。
+        超时 / 连接断 → 复核状态、必要时重连再试。
+        """
+        be = self.backend
+        attempts = 3
+        last_err = ""
+        for i in range(attempts):
+            try:
+                return be.stop()
+            except obsmod.ObsNotRunning as e:
+                self._log(f"停录时 OBS 报「没在录制」（{e}），按已停处理", "info")
+                return ""
+            except Exception as e:
+                last_err = str(e)
+                # 连接断了：重连再试一次，否则这段就白录了
+                if not be.connected:
+                    self._log("停录时连接已断开，尝试重连…", "warn")
+                    try:
+                        if self._ensure_obs() and self.backend:
+                            be = self.backend
+                            if not be.recording():
+                                return ""
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        if not be.recording():
+                            return ""     # OBS 其实已经停了，只是响应慢
+                    except Exception:
+                        pass
+                if i + 1 < attempts:
+                    self._log(f"停录没响应（{last_err}），第 {i+2} 次重试…", "warn")
+                    time.sleep(1.5)
+        self._log(f"停录失败：{last_err}", "error")
+        return ""
+
+    def _finalize_session(self, reason: StopReason, path: str,
+                          already_gone: bool = False):
+        """把当前段落的元数据定死，返回 Session（没有则 None）。"""
+        with self._lock:
+            sess = self._current
+            self._current = None
+        if sess is None:
+            return None
+        now = time.time()
+        self._last_stop_ts = now
+        sess.stopped = now
+        sess.reason = reason.value
+        dur = max(0.0, now - sess.started)
+        # OBS 自己停了（手动/崩溃）：用 OBS 报的时长更可信
+        if already_gone and self.backend and self.backend.name != "hotkey":
+            try:
+                d = self.backend.duration()
+                if d and d > 0:
+                    dur = d
+            except Exception:
+                pass
+        sess.duration = dur
+        sess.path = path or ""
+        self._log(f"■ 停止录制（{_reason_text_s(reason)}，时长 {_fmt_sec(dur)}）"
+                  + (f" → {os.path.basename(path)}" if path else ""), "ok")
+        return sess
+
+    def _close_session_wo_obs(self, reason: StopReason) -> None:
+        """OBS 已不在录时的收尾（界面 stop() 用）。"""
+        sess = self._finalize_session(reason, "", already_gone=True)
+        if sess is not None:
+            self._post_process(sess)
+
+    def _post_process(self, sess: Session) -> None:
+        # OBS 回完 StopRecord 之后，封装器还在把索引/尾部刷进文件（mp4 尤其明显，
+        # 长录像可能要十几秒）。这期间文件是独占打开的：删不掉、更不了名、
+        # ffmpeg 也读不了，日志里就是「另一个程序正在使用此文件」。
+        # 所以所有后处理之前先统一等它放手，等不到就别硬来。
+        released = self._wait_file_released(sess.path, timeout=45.0)
+
+        keep = True
+        dur = sess.duration
+        if self.cfg.record.delete_short and dur < self.cfg.detect.min_record_seconds:
+            if not released:
+                # 还在被占用就删不得，留着比删一半强
+                self._log("录像文件仍被 OBS 占用，本次跳过删除太短录像", "warn")
+            else:
                 keep = not self._discard(sess, f"短于 {self.cfg.detect.min_record_seconds:.0f} 秒")
 
-            if keep and self.cfg.record.remux and sess.path:
-                newp = self._remux(sess.path)
-                if newp:
-                    sess.path = newp
+        if keep and self.cfg.record.remux and sess.path:
+            newp = self._remux(sess.path)
+            if newp:
+                sess.path = newp
 
-            if keep:
-                # OBS 停录后文件句柄不是立刻释放的（封装器还在写尾部/写索引），
-                # 立刻改名或转封装会撞 "另一个程序正在使用此文件"。先等它放手。
-                self._wait_file_released(sess.path)
-                game = self._game_name()
-                if game and sess.path and self.cfg.record.filename_template:
-                    self.rename_output(sess, game)
-                with self._lock:
-                    self.sessions.append(sess)
-                self._on_sessions(list(self.sessions))
-        finally:
-            self._pending_stop = False
-            self._run_lock.release()
+        if not keep:
+            return
+        game = self._game_name()
+        if game and sess.path and self.cfg.record.filename_template:
+            self.rename_output(sess, game)
+        with self._lock:
+            # 同一条记录别重复入表（重试/重入都可能走到这里）
+            if any(s is sess for s in self.sessions):
+                return
+            self.sessions.append(sess)
+        self._on_sessions(list(self.sessions))
 
     def _game_name(self) -> str:
         d = self.detector
@@ -397,30 +628,60 @@ class Controller:
         return self.cfg.detect.window_title or "galgame"
 
     def _wait_file_released(self, path: str, timeout: float = 8.0) -> bool:
-        """等 OBS 真正放手这个文件（能独占打开 → 说明写完了）。"""
+        """等 OBS 真正放手这个文件。
+
+        ⚠ 不能用「能不能打开」来判断。Windows 上 OBS 录制时用的是
+        FILE_SHARE_READ|WRITE，所以 `open(path, "rb+")` 往往**能成功**，
+        但那个句柄没有 FILE_SHARE_DELETE —— 删除和改名照样会被拒
+        （WinError 32：“另一个程序正在使用此文件”）。
+        旧版就是拿 open() 当判据，于是永远「以为已经释放」，然后必然改名失败。
+
+        正确判据：真的试着改个名再改回来。改得动 = 拿到了 DELETE 权限 = 已放手。
+        """
         if not path or not os.path.isfile(path):
             return False
         end = time.time() + timeout
+        probe = path + ".probe"
         while time.time() < end:
             try:
-                with open(path, "rb+"):
-                    return True
+                os.rename(path, probe)
+                try:
+                    os.rename(probe, path)
+                except Exception:
+                    # 改回来了才安全；万一失败至少文件没丢，名字是 .probe
+                    pass
+                return True
             except (PermissionError, OSError):
-                time.sleep(0.25)
+                time.sleep(0.3)
             except Exception:
                 break
         return False
 
+    def _retry_fs(self, fn, path: str, what: str,
+                  timeout: float = 30.0) -> bool:
+        """对文件操作做退避重试（OBS 收尾写 moov 索引时能占十几秒）。"""
+        end = time.time() + timeout
+        while True:
+            try:
+                fn()
+                return True
+            except (PermissionError, OSError) as e:
+                if time.time() >= end:
+                    self._log(f"{what}失败（文件仍被占用）：{e}", "warn")
+                    return False
+                time.sleep(0.5)
+
     def _discard(self, sess: Session, why: str) -> bool:
         p = sess.path
-        if p and os.path.isfile(p):
-            self._wait_file_released(p, timeout=5.0)
-            try:
-                os.remove(p)
-                self._log(f"已丢弃太短的录像（{why}）：{os.path.basename(p)}", "info")
-                return True
-            except Exception as e:
-                self._log(f"删除录像失败：{e}", "warn")
+        if not (p and os.path.isfile(p)):
+            return False
+        # 调用方已经等过释放了；这里再给一点余量，然后真删
+        if not self._wait_file_released(p, timeout=10.0):
+            self._log(f"文件仍被占用，跳过删除：{os.path.basename(p)}", "warn")
+            return False
+        if self._retry_fs(lambda: os.remove(p), p, "删除录像"):
+            self._log(f"已丢弃太短的录像（{why}）：{os.path.basename(p)}", "info")
+            return True
         return False
 
     # ------------------------------------------------------------------ #
@@ -475,16 +736,17 @@ class Controller:
         target = os.path.join(os.path.dirname(sess.path), name + ext)
         if os.path.abspath(target) == os.path.abspath(sess.path):
             return target
-        try:
-            if os.path.exists(target):
-                target = os.path.join(os.path.dirname(sess.path),
-                                      f"{name}_{int(time.time())}{ext}")
+        if os.path.exists(target):
+            target = os.path.join(os.path.dirname(sess.path),
+                                  f"{name}_{int(time.time())}{ext}")
+
+        def _do():
             os.rename(sess.path, target)
             sess.path = target
+
+        if self._retry_fs(_do, sess.path, "重命名", timeout=30.0):
             return target
-        except Exception as e:
-            self._log(f"重命名失败：{e}", "warn")
-            return ""
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +772,7 @@ def _reason_text_s(r: StopReason) -> str:
         StopReason.IDLE: "剧情结束", StopReason.WINDOW: "窗口关闭",
         StopReason.MAXDUR: "达到单段上限", StopReason.MANUAL: "手动停止",
         StopReason.OCCLUDED: "窗口被遮挡", StopReason.MINIMIZED: "窗口被最小化",
+        StopReason.TITLE: "回到标题画面", StopReason.TEXT_LOST: "台词消失",
         StopReason.ERROR: "异常",
     }.get(r, str(r))
 

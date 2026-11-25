@@ -420,6 +420,14 @@ class App(tk.Tk):
         r = self._row_entry(f, r, "停录宽限(秒)", self.v_stopdelay, width=10)
         self._note(f, r - 1, "结束后多录几秒", padx=(6, 0))
 
+        self.v_stoptimeout = tk.StringVar()
+        r = self._row_entry(f, r, "停录等待(秒)", self.v_stoptimeout, width=10)
+        self._note(f, r - 1, "等 OBS 封盘的时长，长录像要留够（默认 20）")
+
+        self.v_restartgap = tk.StringVar()
+        r = self._row_entry(f, r, "重开间隔(秒)", self.v_restartgap, width=10)
+        self._note(f, r - 1, "停录后多久才允许再开录，太小 OBS 会假成功（默认 3）")
+
         r += 1
         ttk.Checkbutton(f, text="连接时把 OBS 录制目录改到上面这个",
                         style="Sky.TCheckbutton",
@@ -457,11 +465,14 @@ class App(tk.Tk):
         self.v_segmented = tk.BooleanVar()
         self.v_detect_occ = tk.BooleanVar()
         self.v_occ_fallback = tk.BooleanVar()
+        self.v_stop_on_min = tk.BooleanVar()
+        self.v_textlost = tk.StringVar()
 
         rows = [
             ("采样间隔(秒)", self.v_interval, "0.3~2，越小越灵敏也越费 CPU"),
             ("变化阈值", self.v_thresh, "0.5~10，画面没动却一直触发就调大"),
             ("结束判定(秒)", self.v_idle, "多久没有新台词算剧情结束"),
+            ("台词消失(秒)", self.v_textlost, "台词框里一个字都读不到多久算结束，0=关闭"),
             ("开录宽限(秒)", self.v_grace, "刚开录时不判结束（片头/加载）"),
             ("最短保留(秒)", self.v_minrec, "比这短的录像自动删掉"),
             ("单段上限(秒)", self.v_maxrec, "防止忘关录一整天，0=不限"),
@@ -480,6 +491,7 @@ class App(tk.Tk):
             (self.v_segmented, "停录后剧情再动时另起一段"),
             (self.v_detect_occ, "检测窗口是否被其它窗口挡住"),
             (self.v_occ_fallback, "被挡住时从窗口后台抓图（多数 galgame 支持）"),
+            (self.v_stop_on_min, "窗口最小化就停止录制（默认关：OBS 通常照样能录）"),
         ]:
             ttk.Checkbutton(f, text=text, style="Sky.TCheckbutton",
                             variable=var).grid(
@@ -511,6 +523,7 @@ class App(tk.Tk):
         self.v_remux = tk.BooleanVar()
         self.v_delshort = tk.BooleanVar()
         self.v_ffmpeg = tk.StringVar()
+        self.v_stop_on_title = tk.BooleanVar()
 
         # 单选框整组独占一行：塞在第三列里时，滚动区宽度不够会把最后一个选项切掉
         tk.Label(f, text="开始条件", bg=T.CARD_BG, fg=T.TEXT_SOFT,
@@ -554,6 +567,10 @@ class App(tk.Tk):
             row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
         ttk.Checkbutton(f, text="自动删除太短的录像", style="Sky.TCheckbutton",
                         variable=self.v_delshort).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
+        ttk.Checkbutton(f, text="回到标题/主菜单时立刻停录（不必等结束判定）",
+                        style="Sky.TCheckbutton",
+                        variable=self.v_stop_on_title).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=3); r += 1
 
         r = self._sep(f, r)
@@ -1151,6 +1168,8 @@ class App(tk.Tk):
         self.v_scene.set(c.obs.scene)
         self.v_obs_dir.set(c.obs.record_dir)
         self.v_stopdelay.set(str(c.obs.stop_delay))
+        self.v_stoptimeout.set(str(c.obs.stop_timeout))
+        self.v_restartgap.set(str(c.obs.restart_gap))
         self.v_setdir.set(c.obs.set_record_dir)
         self.v_autolaunch.set(c.obs.auto_launch)
 
@@ -1161,6 +1180,8 @@ class App(tk.Tk):
         self.v_minrec.set(str(c.detect.min_record_seconds))
         self.v_maxrec.set(str(c.detect.max_record_seconds))
         self.v_occlusion.set(str(c.detect.occlusion_timeout))
+        self.v_textlost.set(str(c.detect.text_lost_timeout))
+        self.v_stop_on_min.set(c.detect.stop_on_minimized)
         self.v_ocr.set(c.detect.ocr)
         self.v_auto_region.set(c.detect.auto_region)
         self.v_require_dlg.set(c.detect.require_dialogue)
@@ -1173,6 +1194,7 @@ class App(tk.Tk):
         self.v_tpl.set(c.record.filename_template)
         self.v_remux.set(c.record.remux)
         self.v_delshort.set(c.record.delete_short)
+        self.v_stop_on_title.set(c.record.auto_stop_on_title)
         self.v_ffmpeg.set(c.record.ffmpeg or "")
 
         self.v_adv_on.set(c.advance.enabled)
@@ -1209,6 +1231,8 @@ class App(tk.Tk):
         c.obs.scene = self.v_scene.get().strip()
         c.obs.record_dir = self.v_obs_dir.get().strip() or "recordings"
         c.obs.stop_delay = num(self.v_stopdelay, 2.0, 0, 120)
+        c.obs.stop_timeout = num(self.v_stoptimeout, 20.0, 3, 300)
+        c.obs.restart_gap = num(self.v_restartgap, 3.0, 0, 60)
         c.obs.set_record_dir = bool(self.v_setdir.get())
         c.obs.auto_launch = bool(self.v_autolaunch.get())
 
@@ -1219,6 +1243,8 @@ class App(tk.Tk):
         c.detect.min_record_seconds = num(self.v_minrec, 15.0, 0, 86400)
         c.detect.max_record_seconds = num(self.v_maxrec, 14400.0, 0, 864000)
         c.detect.occlusion_timeout = num(self.v_occlusion, 180.0, 0, 86400)
+        c.detect.text_lost_timeout = num(self.v_textlost, 0.0, 0, 86400)
+        c.detect.stop_on_minimized = bool(self.v_stop_on_min.get())
         c.detect.ocr = bool(self.v_ocr.get())
         c.detect.auto_region = bool(self.v_auto_region.get())
         c.detect.require_dialogue = bool(self.v_require_dlg.get())
@@ -1231,6 +1257,7 @@ class App(tk.Tk):
         c.record.filename_template = self.v_tpl.get() or "{game}_{time}"
         c.record.remux = bool(self.v_remux.get())
         c.record.delete_short = bool(self.v_delshort.get())
+        c.record.auto_stop_on_title = bool(self.v_stop_on_title.get())
         c.record.ffmpeg = self.v_ffmpeg.get().strip()
 
         c.advance.enabled = bool(self.v_adv_on.get())
@@ -1298,6 +1325,7 @@ def _reason_text(reason: str) -> str:
         "idle": "剧情结束", "window_closed": "窗口关闭",
         "max_duration": "达上限", "manual": "手动",
         "occluded": "被遮挡", "minimized": "最小化", "error": "异常",
+        "title": "回到标题", "text_lost": "台词消失",
     }.get(reason, reason or "-")
 
 

@@ -34,6 +34,8 @@ class ObsConfig:
     set_record_dir: bool = True       # 连接成功后把 OBS 录制目录改到 record_dir
     scene: str = ""                   # 非空则切到该场景
     stop_delay: float = 2.0           # 判定结束后再录几秒，防止切掉尾巴
+    stop_timeout: float = 20.0        # 等 StopRecord 响应的超时（长录像封盘要几秒）
+    restart_gap: float = 3.0          # 停录后至少隔多久才允许再开录（OBS 输出冷却）
 
 
 @dataclass
@@ -52,13 +54,18 @@ class DetectConfig:
 
     confirm_ticks: int = 2            # 连续几次采样有变化才认为剧情开始
     settle_frames: int = 2            # 画面静止几帧后 OCR（抓「一句话说完」）
-    text_lost_timeout: float = 0.0    # 对话框消失多久判结束；0=不启用
+    text_lost_timeout: float = 0.0    # 台词框里彻底没字多久判结束；0=不启用
+    cooldown_seconds: float = 5.0     # 停录后至少隔多久才允许重开一段（防回标题反复起停）
     segmented: bool = True            # 停录后剧情再动时另起一段（否则只录一段）
     require_dialogue: bool = True     # 开始录制要求画面里确实有台词文字
     detect_occlusion: bool = True     # 检测游戏窗口是否被别的窗口挡住
     occlusion_timeout: float = 180.0  # 被挡住多久算「剧情中断」（0=不因遮挡停）
     occluded_fallback: bool = True    # 被挡住时改从窗口后台抓图，照常读台词/计时
-    minimized_timeout: float = 30.0   # 窗口最小化多久就停录（最小化必然录到黑屏）
+    # 最小化：默认**不**停录。OBS 的窗口/游戏采集在很多配置下窗口最小化后
+    # 照样能正常出画面，凭什么替用户决定「这段不要了」。
+    # 想恢复旧行为（最小化就停）就把 stop_on_minimized 打开。
+    stop_on_minimized: bool = False
+    minimized_timeout: float = 300.0  # 仅当 stop_on_minimized=True 时生效
     choice_check: bool = True         # 顺便检测选项界面（自动推进要用）
     choice_check_interval: float = 0.0  # 0=只在需要时查
 
@@ -93,6 +100,7 @@ class RecordConfig:
     """录制行为。"""
     start_mode: str = "on_dialogue"   # on_dialogue | on_window | manual
     stop_mode: str = "on_end"         # on_end | manual
+    auto_stop_on_title: bool = True   # 画面回到标题/主菜单时立刻停录（不等 idle 超时）
     pause_when_unfocused: bool = False  # 游戏窗口失去焦点时视为暂停
     unfocus_grace: float = 90.0       # 切走后多久算暂停（秒）
     filename_template: str = "{game}_{time}"

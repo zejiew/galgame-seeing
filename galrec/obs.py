@@ -16,10 +16,11 @@ import base64
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import websocket  # websocket-client
@@ -29,7 +30,44 @@ except Exception:  # pragma: no cover
 
 
 class ObsError(Exception):
-    pass
+    def __init__(self, message: str = "", code: Optional[int] = None,
+                 request: str = ""):
+        super().__init__(message)
+        #: obs-websocket 的 RequestStatus 码（v5）；v4 为 -1；连接类错误为 None
+        self.code = code
+        #: 出错的请求名，如 StartRecord / StopRecord
+        self.request = request
+
+
+class ObsNotRunning(ObsError):
+    """OBS 那边根本没在录（v5 叫 OutputNotRunning，code 501）。
+
+    这不是「失败」，是「无需停」。上层要能单独识别出来，
+    否则每次正常停录都会被当成「停录失败：501」吓用户一跳。
+    """
+
+
+#: 表示「目标输出本来就没在跑」的错误码/文案。v5 是 5xx 系列，
+#: 其中 501 = OutputNotRunning；v4 是文字错误。
+_NOT_RUNNING_CODES = {500, 501, 502, 503, 504, 505, 506}
+_NOT_RUNNING_WORDS = ("not running", "not active", "not started",
+                      "not recording", "outputnotrunning", "outputnotpaused")
+
+
+def is_not_running_error(err) -> bool:
+    """判断一条错误（对象或文本）是不是「本来就没在录」。"""
+    code = getattr(err, "code", None)
+    if isinstance(code, int) and code in _NOT_RUNNING_CODES:
+        return True
+    text = str(err)
+    low = text.lower()
+    if any(w in low for w in _NOT_RUNNING_WORDS):
+        return True
+    # 形如 "StopRecord 失败：501" / "code 501"
+    for c in _NOT_RUNNING_CODES:
+        if re.search(rf"\b{c}\b", low):
+            return True
+    return False
 
 
 @dataclass
@@ -44,6 +82,7 @@ class ObsStatus:
     record_dir: str = ""
     port: int = 0               # 实际连上的端口
     message: str = ""
+    output_active: bool = False  # 采集输出是否在跑（不在跑就录不出东西）
 
 
 def _b64_sha256(s: str) -> str:
@@ -309,11 +348,14 @@ class ObsClient:
             except Exception:
                 pass
         self._alive.clear()
-        # 唤醒所有等待中的请求
+        # 唤醒所有等待中的请求，并把错误留在旁路表里，
+        # 这样 _wait 取到的是一条像样的「连接已断开」，而不是「请求状态丢失」
         with self._lock:
             for rid, slot in self._responses.items():
-                slot["error"] = "连接已断开"
+                slot["error"] = "连接已断开（OBS 关掉了 WebSocket）"
                 slot["event"].set()
+                self._completed[rid] = {"result": None,
+                                        "error": slot["error"]}
             self._responses.clear()
 
     def _dispatch(self, msg: dict) -> None:
@@ -348,20 +390,29 @@ class ObsClient:
                 pass
 
     def _complete(self, rid: str, result=None, error: str = "") -> None:
-        """把响应交给等待者；万一没人等（响应比注册还快），就暂存。"""
+        """把响应交给等待者。
+
+        ⚠ 这里**只能**填好 slot 并 set 事件，**不能** pop。
+        旧版在这里 pop，于是出现一个竞态：
+        收包线程比 `_wait` 先跑到时，slot 已被 pop 掉，
+        `_wait` 再查 `_responses` 得到 None，只好报「请求状态丢失」——
+        而这个异常会被上层 `recording()` 吞成 False，造成「明明在录却以为没录」，
+        于是跳过 StopRecord，OBS 继续写文件 → 文件被占用 → 停录失败。
+        slot 的生命周期由 `_wait` 负责回收。
+        """
         if not rid:
             return
         with self._lock:
-            slot = self._responses.pop(rid, None)
+            slot = self._responses.get(rid)
             if slot is None:
-                # 还没人注册：先记下来，_wait 会来取
+                # 响应比注册还快：先记下来，_wait 会来取
                 self._completed[rid] = {"result": result, "error": error}
                 if len(self._completed) > 64:   # 防止异常情况下无限增长
                     for k in list(self._completed)[:32]:
                         self._completed.pop(k, None)
                 return
-        slot["result"] = result
-        slot["error"] = error
+            slot["result"] = result
+            slot["error"] = error
         slot["event"].set()
 
     # ------------------------------------------------------------------ #
@@ -386,14 +437,20 @@ class ObsClient:
     def _wait(self, rid: str, to: float) -> dict:
         """等某条请求的响应。
 
-        注意竞态：响应可能比这个函数跑得还快（收包线程已经处理完并 pop 掉了），
-        所以要先把"已完成"的结果也留在字典里，只是标记成 done，而不是立刻删。
+        竞态的三种时序都要活着出去：
+        1. 正常：先注册 slot，后收到响应；
+        2. 响应比 `_wait` 跑得还快：slot 里已经被 `_complete` 填好、事件已 set，
+           这里直接拿到（所以 `_complete` 绝不能 pop，见那里的注释）；
+        3. 极端情况 slot 还没注册上（理论上 v5 不会，但别赌）：
+           给一小段宽限期轮询，仍没有才报错。
         """
         deadline = time.time() + to
-        with self._lock:
-            slot = self._responses.get(rid)
-        if slot is None:
-            # 收包线程已经处理过（极快响应），从旁路表里取
+        grace = time.time() + min(1.0, max(0.05, to / 4))
+        while True:
+            with self._lock:
+                slot = self._responses.get(rid)
+            if slot is not None:
+                break
             with self._lock:
                 done = self._completed.get(rid)
             if done is not None:
@@ -402,7 +459,9 @@ class ObsClient:
                 if done.get("error"):
                     raise ObsError(done["error"])
                 return done.get("result") or {}
-            raise ObsError(f"请求状态丢失：{rid}")
+            if time.time() >= grace:
+                raise ObsError(f"请求状态丢失：{rid}")
+            time.sleep(0.005)
         if not slot["event"].wait(max(0.01, deadline - time.time())):
             with self._lock:
                 self._responses.pop(rid, None)
@@ -428,7 +487,17 @@ class ObsClient:
         res = self._wait(rid, to)
         st = res.get("requestStatus") or {}
         if not st.get("result"):
-            raise ObsError(f"{rt} 失败：{st.get('comment') or st.get('code')}")
+            # 错误码一定要带上：401/501 这些数字本身就是判断依据
+            # （501 = OutputNotRunning，即「本来就没在录」）
+            code = st.get("code")
+            comment = st.get("comment") or ""
+            detail = f"{code}" + (f" {comment}" if comment else "") if code is not None \
+                else (comment or "未知错误")
+            err = ObsError(f"{rt} 失败：{detail}")
+            # 带着结构化字段走，上层判断不用再去匹配字符串
+            err.code = code          # type: ignore[attr-defined]
+            err.request = rt         # type: ignore[attr-defined]
+            raise err
         return res.get("responseData") or {}
 
     def _call_v4(self, rt: str, params: dict, to: float) -> Any:
@@ -445,7 +514,10 @@ class ObsClient:
             raise ObsError(f"发送失败：{e}")
         res = self._wait(rid, to)
         if res.get("status") == "error":
-            raise ObsError(f"{rt} 失败：{res.get('error')}")
+            err = ObsError(f"{rt} 失败：{res.get('error')}")
+            err.code = -1            # type: ignore[attr-defined]
+            err.request = rt         # type: ignore[attr-defined]
+            raise err
         return res
 
     # ------------------------------------------------------------------ #
@@ -458,49 +530,155 @@ class ObsClient:
             return {}
 
     def start_record(self) -> bool:
-        if self.negotiated == "v5":
-            st = self.record_status()
-            if st.recording:
-                return True
-            self.call("StartRecord")
-        else:
-            st = self.record_status()
-            if st.recording:
-                return True
-            self.call("StartRecording")
-        return True
-
-    def stop_record(self) -> str:
-        """停止录制，返回输出文件路径（拿不到则空串）。"""
+        """开始录制。已经在录就直接返回 True（幂等）。"""
+        st = self.record_status()
+        if st.recording:
+            return True
         if self.negotiated == "v5":
             try:
-                data = self.call("StopRecord") or {}
+                self.call("StartRecord")
+            except ObsError as e:
+                if "output running" in str(e).lower() or "500" in str(e):
+                    return True      # 并发/状态滞后：其实已经在录了
+                raise
+        else:
+            try:
+                self.call("StartRecording")
+            except ObsError as e:
+                if "already" in str(e).lower():
+                    return True
+                raise
+        return True
+
+    def stop_record(self, timeout: Optional[float] = None) -> str:
+        """停止录制，返回输出文件路径（拿不到则空串）。
+
+        三种情况要分开处理：
+
+        1. 本来就没在录（v5 是 `OutputNotRunning` / code 501）→ 不是错误，
+           抛 ObsNotRunning 让上层安静跳过。旧版把 501 当异常抛，
+           用户看到的就是「停录失败：501」，其实根本没什么可停的。
+        2. 停录超时（长录像要封盘、写索引，几秒到几十秒）→ 抛 ObsError，
+           但**不要**把这当成「还在录」，上层会自己复核状态。
+        3. 成功 → 返回 outputPath。
+        """
+        to = timeout or self.timeout
+        if self.negotiated == "v5":
+            try:
+                data = self.call("StopRecord", timeout=to) or {}
                 return str(data.get("outputPath") or "")
             except ObsError as e:
-                if "not active" in str(e).lower():
-                    return ""
+                if is_not_running_error(str(e)):
+                    raise ObsNotRunning(str(e))
                 raise
-        self.call("StopRecording")
+        try:
+            self.call("StopRecording", timeout=to)
+        except ObsError as e:
+            if is_not_running_error(str(e)):
+                raise ObsNotRunning(str(e))
+            raise
         return ""
 
     def record_status(self) -> ObsStatus:
         if self.negotiated == "v5":
             d = self.call("GetRecordStatus")
+            rec = bool(d.get("outputActive"))
             return ObsStatus(
                 connected=True, protocol="v5",
-                recording=bool(d.get("outputActive")),
+                recording=rec,
+                output_active=rec,
                 recording_paused=bool(d.get("outputPaused")),
                 duration=float(d.get("outputDuration") or 0) / 1000.0,
                 bytes=int(d.get("outputBytes") or 0),
             )
         d = self.call("GetRecordingStatus")
+        rec = bool(d.get("isRecording"))
         return ObsStatus(
             connected=True, protocol="v4",
-            recording=bool(d.get("isRecording")),
+            recording=rec,
+            output_active=rec,
             recording_paused=bool(d.get("isRecordingPaused")),
             duration=_tc_to_sec(d.get("recordTimecode", "")),
             bytes=int(d.get("recordBytes") or 0),
         )
+
+    def output_ready(self) -> bool:
+        """采集输出是否在跑。
+
+        注意：v5 的 GetOutputStatus 需要的是**输出名**，录制输出在不同 OBS 版本里
+        叫 `record` / `OBS_WEBSOCKET_OUTPUT_RECORD`，查不到会回 600。
+        所以这里只当「附加信息」，不拿它当开录成败的判据——
+        真正的判据是 `wait_recording_live()` 里「时长/字节有没有在涨」。
+        """
+        try:
+            if self.negotiated == "v5":
+                for name in ("record", "OBS_WEBSOCKET_OUTPUT_RECORD"):
+                    try:
+                        d = self.call("GetOutputStatus",
+                                      {"outputName": name}) or {}
+                        return bool(d.get("outputActive"))
+                    except ObsError:
+                        continue
+                return True
+            return True
+        except ObsError:
+            return True
+
+    def wait_recording_live(self, timeout: float = 6.0,
+                            settle: float = 1.0) -> Tuple[bool, str]:
+        """确认 StartRecord 之后 OBS **真的**在写数据。
+
+        OBS 有个很容易踩的坑（实测 OBS 33 / obs-websocket 5.7）：
+        刚停录 1~2 秒内再 StartRecord，OBS 会返回成功、`outputActive` 也一度是 true，
+        但 `outputDuration` 永远是 0、一个字节都不写，随后 StopRecord 直接给 501，
+        这一整段等于白录。
+
+        所以不能只看 outputActive，要同时满足：
+        - outputActive 为 true；
+        - 连续 `settle` 秒内 outputDuration 或 outputBytes 在**增长**
+          （说明编码器真的在出数据）。
+
+        返回 (是否真在录, 没真录的原因)。
+        """
+        end = time.time() + max(1.0, timeout)
+        last_dur = 0.0
+        last_bytes = 0
+        last_progress = 0.0
+        started = False
+        last_err = ""
+        while time.time() < end:
+            try:
+                data = self.call("GetRecordStatus") or {}
+            except ObsError as e:
+                last_err = str(e)
+                time.sleep(0.25)
+                continue
+            active = bool(data.get("outputActive"))
+            dur = float(data.get("outputDuration") or 0) / 1000.0
+            nbytes = int(data.get("outputBytes") or 0)
+            last_err = ""
+            if not active:
+                started = False
+                last_dur, last_bytes = 0.0, 0
+                last_progress = 0.0
+                time.sleep(0.25)
+                continue
+            if not started:
+                started = True
+                last_progress = time.time()
+            if dur > last_dur or nbytes != last_bytes:
+                # 有数据在动：这就是活的录制
+                if time.time() - last_progress >= settle and (dur > 0 or nbytes > 0):
+                    return True, ""
+            else:
+                last_progress = time.time()
+            last_dur = max(last_dur, dur)
+            last_bytes = nbytes
+            time.sleep(0.25)
+        if last_err:
+            return False, last_err
+        return False, ("OBS 报了「正在录制」但不产生任何数据"
+                       "（常见于刚停录后立刻重开；已自动回避）")
 
     def get_record_dir(self) -> str:
         rt = "GetRecordDirectory" if self.negotiated == "v5" else "GetRecordingFolder"
