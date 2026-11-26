@@ -122,6 +122,10 @@ class Detector:
         self._title_hits = 0
         self._auto_try_ts = 0.0
         self._idle = 0.0
+        # 主菜单/标题画面的证据（回主页面后误开录、误判「还有台词」都靠它拦）
+        self._menu_streak = 0        # 连续几次 OCR 读到的是菜单项
+        self._menu_seen_ts = 0.0     # 最近一次读到菜单项的时刻
+        self._after_menu = False     # 刚从主菜单过来：下一句台词必须算「新的一句」
         self._last_snap = Snapshot()
         self.latest_frame: Optional[Image.Image] = None
 
@@ -272,9 +276,17 @@ class Detector:
                         img_min = None
             if img_min is not None and not capture.Grabber.is_blank(img_min):
                 text = ""
+                is_menu = False
                 if self.cfg.detect.ocr:
-                    text = self._read_text(img_min)
-                has_dlg = len(ocr.normalize(text)) >= self.cfg.detect.dialogue_min_chars
+                    text, is_menu = self._read_dialogue(img_min)
+                if is_menu:
+                    self._menu_streak += 1
+                    self._menu_seen_ts = now0
+                    text = ""
+                else:
+                    self._menu_streak = 0
+                has_dlg = (not is_menu) and \
+                    len(ocr.normalize(text)) >= self.cfg.detect.dialogue_min_chars
                 new_line = self._merge_line(text, now0) if has_dlg else False
                 if has_dlg:
                     self._no_text_ticks = 0
@@ -397,14 +409,28 @@ class Detector:
                 now - self._last_ocr_ts >= d.ocr_interval:
             if changed or now - self._last_ocr_ts >= max(3.0, d.ocr_interval * 3):
                 self._last_ocr_ts = now
-                text = self._read_text(img)
-                has_dialogue = len(ocr.normalize(text)) >= d.dialogue_min_chars
+                text, is_menu = self._read_dialogue(img)
+                if is_menu:
+                    # 对话框区域里读到的是「开始游戏 / 载入存档」这种菜单项：
+                    # 这不是台词。回主页面后光标一动就换一个词，如果当台词算，
+                    # 就会不停刷新「最后推进时间」→ 永远不停录；冷却一过又会
+                    # 拿它当新台词把录制重新拉起来。所以这里两边都不认。
+                    self._menu_streak += 1
+                    self._menu_seen_ts = time.time()
+                    text = ""
+                    has_dialogue = False
+                    self._no_text_ticks += 1
+                else:
+                    self._menu_streak = 0
+                    has_dialogue = len(ocr.normalize(text)) >= d.dialogue_min_chars
                 if has_dialogue:
                     self._no_text_ticks = 0
                     new_line = self._merge_line(text, now)
                 else:
                     self._no_text_ticks += 1
-                    if self.phase is Phase.RECORDING:
+                    # 读到菜单时不要重探对话框区域：那会把「自动区域」锁到
+                    # 菜单文字上，从此主页面每一行都成了「台词」。
+                    if self.phase is Phase.RECORDING and not is_menu:
                         self._maybe_auto_region(threshold=d.ocr_interval * 2)
 
         if changed and not occluded:
@@ -545,6 +571,14 @@ class Detector:
         这里维护 `_burst_best`：同一句里只保留最完整（最长）的形态。
         真正算新台词的条件是：相似度低，或者「短到像是换了一句」。
         """
+        # 刚从主菜单/标题回来：把旧台词忘掉，让读到的第一句一定算「新的一句」。
+        # 否则玩家在标题画面点「开始游戏」后，第一句如果碰巧和上次停录那句
+        # 有点像，就会被判成「同一句」，于是又开不了录。
+        if self._after_menu:
+            self._after_menu = False
+            if text:
+                self._burst_best = ""
+                self._last_text = ""
         cur = ocr.normalize(text)
         best = ocr.normalize(self._burst_best)
         self._last_dialogue_ts = now      # 「最后一次确实读到台词」的时刻
@@ -601,6 +635,8 @@ class Detector:
             return
         if mode == "on_window":
             if self._change_streak >= max(1, d.confirm_ticks):
+                if self._blocked_by_menu():
+                    return
                 self._begin_segment(reason="window")
             return
         # on_dialogue
@@ -614,13 +650,35 @@ class Detector:
             cd = float(self.cfg.detect.cooldown_seconds or 0)
             if cd > 0 and time.time() - (self._last_stop_ts or 0) < cd:
                 return
+            # 主菜单/标题画面上绝不开录：菜单项会被 OCR 当成「新台词」，
+            # 冷却一过就在主页面拉起一段废片。这是「异常开始录制」的主因。
+            if self._blocked_by_menu():
+                return
             self._begin_segment(reason="dialogue")
         else:
             if changed and self._change_streak >= max(1, d.confirm_ticks):
                 cd = float(self.cfg.detect.cooldown_seconds or 0)
                 if cd > 0 and time.time() - (self._last_stop_ts or 0) < cd:
                     return
+                if self._blocked_by_menu():
+                    return
                 self._begin_segment(reason="activity")
+
+    def _blocked_by_menu(self) -> bool:
+        """现在这屏是不是主菜单——是的话不许开录。
+
+        比 ``_on_menu_screen`` 宽松一档：对话框里**一次**读到菜单项就算，
+        再加上「最近刚看到过菜单」的时间窗。宁可晚开一段（等玩家真的进了
+        剧情，第一句台词出来就会开），也不要在主页面上切出一堆 3 秒废片。
+        """
+        now = time.time()
+        if self._menu_streak >= 1 and self._menu_seen_ts and \
+                now - self._menu_seen_ts <= max(10.0, self.cfg.detect.cooldown_seconds * 2):
+            return True
+        # 整窗证据：开机后在主菜单干等时，对话框区域可能一个菜单词都读不到
+        if self._menu_probe_due(now):
+            return self._looks_like_menu_screen()
+        return False
 
     # ------------------------------------------------------------------ #
     # 结束判定
@@ -649,13 +707,25 @@ class Detector:
                 self._end_segment(StopReason.OCCLUDED)
             return
 
+        # 判定这一屏是不是主菜单/标题画面（有缓存，见 _on_menu_screen）。
+        # 尊重界面上的「回到标题/主菜单时立刻停录」开关：关掉它就不查，
+        # 只走后面的 idle 超时——用户显式关掉就不该被更激进的判据推翻。
+        on_menu = self.cfg.record.auto_stop_on_title and self._on_menu_screen(now)
+
+        # 「只手动停」：除了硬性安全阀（单段上限/窗口没了/画面全黑/回主菜单），
+        # 一律不许自动停。回主菜单必须算安全阀——不然它会一直录下去。
+        manual_only = (self.cfg.record.stop_mode == "manual")
+
+        # 回到主菜单/标题：这是「剧情已经结束」最硬的证据，不受宽限期限制
+        # （玩家点「返回标题」后可能几秒内就关游戏，等宽限期过去就来不及了）。
+        # 以前这里直接 return，选了「只手动停」就永远不停。
+        if on_menu:
+            self._end_segment(StopReason.TITLE)
+            return
+
         # 宽限期内不判结束
         if seg_elapsed < d.start_grace:
             return
-
-        # 「只手动停」：除了硬性安全阀（单段上限/窗口没了/画面全黑），
-        # 一律不许自动停。这个选项以前在界面上有、代码里压根没读，等于假的。
-        manual_only = (self.cfg.record.stop_mode == "manual")
 
         # 结束判定只看「有没有新台词」。
         # 像素变化不能作为推进信号——动态背景、Live2D 呼吸、UI 闪烁一直在动，
@@ -683,6 +753,8 @@ class Detector:
 
         # 回到标题/主菜单：不必等 idle 超时，直接停。
         # 只在「冷静了一会儿」之后才跑整窗 OCR，避免录制中每帧都花 1 秒。
+        # ⚠ 这条是旧判据（要求「对话框里没有台词」），对「菜单压在对话框位置」
+        # 的作品永远判不出来；真正的判据在上面的 _on_menu_screen。
         if not manual_only and self.cfg.record.auto_stop_on_title:
             probe_after = min(max(20.0, d.idle_timeout * 0.35),
                               max(20.0, d.idle_timeout - 10.0)) \
@@ -691,11 +763,98 @@ class Detector:
                 if self._looks_like_title_screen():
                     self._end_segment(StopReason.TITLE)
                     return
-
         if manual_only:
             return
         if d.idle_timeout > 0 and self._idle >= d.idle_timeout:
             self._end_segment(StopReason.IDLE)
+
+    # ------------------------------------------------------------------ #
+    # 主菜单 / 标题画面识别（回主页面的核心判据）
+    # ------------------------------------------------------------------ #
+    #: 一屏被判定为「菜单」所需的最少命中的菜单词数
+    _MENU_MIN_HITS = 2
+    #: 整窗 OCR 的最短间隔（很贵，0.5~1.5 秒）
+    _MENU_PROBE_GAP = 1.5
+
+    def _on_menu_screen(self, now: float) -> bool:
+        """这一屏是不是主菜单 / 标题画面。
+
+        两条独立证据，任一成立即算：
+
+        1. **对话区域**里连续两次读到菜单项
+           （``ocr.looks_like_menu_lines``：竖排多行菜单词）；
+        2. **整窗**里出现 ≥2 个不同的菜单词，且这些词竖着排在多行上。
+
+        ⚠ 证据 2 要跑整窗 OCR（0.5~1.5 秒），只在「有理由怀疑已经不在剧情里」
+        时才跑：台词停了一阵 / 对话框读不到字 / 已经读到菜单项。
+        正常对话时每秒跑一次整窗 OCR 会把检测线程拖垮，反而让停录更迟钝。
+        """
+        # 证据 1：对话框里读到菜单项（这次采样顺带就有，几乎不额外花钱）
+        if self._menu_streak >= 2 and \
+                now - self._menu_seen_ts <= max(6.0, self.cfg.detect.ocr_interval * 3):
+            return True
+        suspect = (self._menu_streak >= 1
+                   or self._no_text_ticks >= 3
+                   or self._idle >= 8.0)
+        if not suspect:
+            return False
+        if not self._menu_probe_due(now):
+            return False
+        return self._looks_like_menu_screen()
+
+    def _menu_probe_due(self, now: float) -> bool:
+        last = getattr(self, "_menu_probe_ts", 0.0)
+        if now - last < self._MENU_PROBE_GAP:
+            return False
+        self._menu_probe_ts = now
+        return True
+
+    def _looks_like_menu_screen(self) -> bool:
+        """整窗 OCR，数「不同的菜单词」。返回是否像主菜单/标题。
+
+        比 ``_looks_like_title_screen`` 更可靠：那一个要求「对话框里没有台词」，
+        于是「菜单就压在对话框位置」的游戏永远判不出来——正是回主页面后
+        一直不停录的成因。这里改看菜单词本身的结构。
+        """
+        if self._occluded_since or not self.win:
+            return False
+        try:
+            cl = windows.client_rect(self.win.hwnd)
+            img = capture.Grabber(cl).grab()
+            if img is None or capture.Grabber.is_blank(img):
+                return False
+            lines = ocr.recognize(img, min_conf=max(0.5, self.cfg.detect.ocr_min_conf))
+            if not lines:
+                return False
+            hits, hit_rows = ocr.menu_evidence(lines)
+            # 必须「多个不同的菜单词 + 竖着排成多行」：
+            # 剧情界面底部的工具栏（自动/跳过/存档/设置）也是一堆菜单词，
+            # 但它们在同一行上，不能因此把剧情中途的录像掐断。
+            if len(hits) < self._MENU_MIN_HITS or hit_rows < 2:
+                return False
+            # 对话框里若有「不像菜单」的文字 → 是台词，说明还在剧情里。
+            # ⚠ 判据必须是「像不像菜单项」，不能是「有没有字」：
+            # 主菜单的菜单项经常正好压在对话框位置（「设置」「画廊」这种
+            # 两字短词），那当然有字，但它不是台词，不能因此否掉菜单判定。
+            if self._grabber is not None:
+                gb = self._grabber.bbox
+                sub = (gb[0] - cl[0], gb[1] - cl[1], gb[2] - cl[0], gb[3] - cl[1])
+                if sub[2] - sub[0] > 4 and sub[3] - sub[1] > 4:
+                    box = img.crop(sub)
+                    dlg_lines = ocr.filter_dialogue(
+                        ocr.recognize(box, min_conf=self.cfg.detect.ocr_min_conf),
+                        min_conf=self.cfg.detect.ocr_min_conf)
+                    if dlg_lines:
+                        # 有「够长、又不像菜单项」的文字 → 那是台词，还在剧情里。
+                        # 短词不否决：它可能只是被 OCR 出来的菜单项/图标文字。
+                        for l in dlg_lines:
+                            core = ocr.normalize(l.text)
+                            if len(core) >= max(self.cfg.detect.dialogue_min_chars, 6) \
+                                    and ocr.menu_kind(l.text) == 0:
+                                return False
+            return True
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ #
     # 标题 / 主菜单识别
@@ -789,12 +948,21 @@ class Detector:
             # 已经不是录制中了：重复的结束事件不该再发一遍（会触发重复 StopRecord → 501）
             return
         dur = now - self._seg_start_ts
-        self._last_stop_text = self._last_text
+        stop_text = self._last_text      # 先留一份，下面可能要清空
+        if reason is StopReason.TITLE:
+            # 刚回到主菜单：把「旧台词」作废。玩家点「开始游戏」*之后*的第一句
+            # 必须算新的一句，否则会跟停录时那句撞上相似度阈值而不开录。
+            self._last_stop_text = ""
+            self._burst_best = ""
+            self._last_text = ""
+            self._after_menu = True
+        else:
+            self._last_stop_text = self._last_text
         self._last_stop_ts = now
         self._set_phase(Phase.COOLDOWN if self.cfg.detect.segmented else Phase.IDLE)
         self._emit("segment_stop", {
             "reason": reason.value, "duration": round(dur, 1),
-            "index": self._segments, "text": self._last_text,
+            "index": self._segments, "text": stop_text,
         })
         if reason in (StopReason.WINDOW, StopReason.MAXDUR):
             self._set_phase(Phase.IDLE, note=reason.value)
@@ -849,8 +1017,12 @@ class Detector:
             if not occluded_now and recent_change and due:
                 self._auto_try_ts = now
                 rel = self._detect_auto_region(cl, quiet=True)
-                self._auto_rel = rel
+                # ⚠ 只有「真的找到对话文字」才采用。以前失败也写
+                # self._auto_rel = None，于是回主页面时会退化成「窗口下半部分」
+                # 这块大区域——菜单项、标题、按钮全在里面，之后每一帧都能 OCR
+                # 出「台词」，永远不停录。
                 if rel is not None:
+                    self._auto_rel = rel
                     src = "自动"
         if rel is None:
             # 兜底：取窗口下半部分（绝大多数 galgame 台词都在下方）
@@ -909,6 +1081,23 @@ class Detector:
     # ------------------------------------------------------------------ #
     # 工具
     # ------------------------------------------------------------------ #
+    def _read_dialogue(self, img: Image.Image) -> tuple:
+        """读对话框区域，返回 (台词, 是否其实是菜单项)。
+
+        菜单项和台词长得一样都是「一行短文字」，光靠长度分不开。这里用
+        整批识别结果做判定：如果这堆字整体像主菜单（≥2 个菜单词 / 全是
+        2~3 字短标签），就判定为菜单，台词按空处理。
+        """
+        if img is None:
+            return "", False
+        lines = ocr.recognize(img, min_conf=self.cfg.detect.ocr_min_conf)
+        if not lines:
+            return "", False
+        good = ocr.filter_dialogue(lines, min_conf=self.cfg.detect.ocr_min_conf)
+        if good and ocr.looks_like_menu_lines(good):
+            return "", True
+        return ocr.dialogue_text(lines, min_conf=self.cfg.detect.ocr_min_conf), False
+
     def _read_text(self, img: Image.Image) -> str:
         if img is None:
             return ""

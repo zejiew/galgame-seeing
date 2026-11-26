@@ -306,15 +306,30 @@ class Controller:
     # 录制起停
     # ------------------------------------------------------------------ #
     def _start_record(self, payload: dict) -> None:
-        if not self._run_lock.acquire(blocking=False):
-            # 开录抢不到锁（基本只会是上一段还没收拾完）→ 放弃这一次是安全的：
-            # 等锁一放开，检测线程的下一次采样还会再触发一次 segment_start。
-            self._log("上一段还在收尾，跳过本次开录", "warn")
+        # 正在停录（_request_stop 已经把 _stopping 置真）时绝不开录：
+        # 否则「剧情结束 → 停录」还没收完尾，检测器又把下一段拉起来，
+        # 停录线程随后把这段刚开的掐掉，切出一堆 0 秒废片。
+        if self._stop_in_flight():
+            self._log("正在停录，本条开录请求作废", "warn")
+            self._abort_detector_segment()
+            return
+        # 停录后处理可能要几十秒（等 OBS 放手、ffmpeg 转封装），以前这段时间
+        # 一直占着 _run_lock，开录抢不到锁就直接 return——而检测器已经进了
+        # RECORDING，于是界面显示「录制中」、OBS 里其实没录（假录制状态）。
+        # 现在改成「等锁 + 拿不到就明确回滚」，宁可不开也不能状态错位。
+        if not self._run_lock.acquire(timeout=20.0):
+            self._log("上一段还在收尾，本次开录跳过（检测器已回滚，稍后会自动重试）", "warn")
+            self._abort_detector_segment()
             return
         try:
+            # 拿到锁之后再确认一次：等锁的这 20 秒里可能已经有人要求停录了
+            if self._stop_in_flight():
+                self._log("等锁期间收到停录请求，本次开录作废", "warn")
+                self._abort_detector_segment()
+                return
             if not (self.backend and self.backend.connected):
                 if not self._ensure_obs():
-                    self.detector.force_stop()
+                    self._abort_detector_segment()
                     return
             be = self.backend
             # OBS 的录制输出有冷却：刚 StopRecord 之后马上 StartRecord 容易「假成功」。
@@ -361,6 +376,29 @@ class Controller:
                       f"{_reason_trigger(payload.get('reason',''))}）", "ok")
         finally:
             self._run_lock.release()
+
+    def _stop_in_flight(self) -> bool:
+        """是否有停录请求正在处理（含 stop_delay 的等待期）。"""
+        with self._stop_guard:
+            return bool(self._stopping)
+
+    def _abort_detector_segment(self) -> None:
+        """开录没落地时，把检测器的段状态回滚。
+
+        ⚠ 必须回滚：检测器在抛 segment_start 时已经切到 RECORDING，
+        如果控制器这边默默放弃，它就永远停在「录制中」——界面一直显示录制，
+        OBS 里没有文件，之后的结束判定也不会再触发（`_end_segment` 只在
+        RECORDING 才走），于是「录不结束、也录不出东西」。
+        """
+        try:
+            self.detector.abort_segment()
+        except AttributeError:
+            try:
+                self.detector.force_stop()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _kick_output_reset(self) -> None:
         """把卡住的录制输出踢一下：发 StopRecord（多半回 501），再等它释放。

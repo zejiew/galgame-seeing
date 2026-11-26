@@ -627,9 +627,297 @@ def test_obs_error_carries_code():
     check("异常消息本身仍然可读", str(e) == "StopRecord 失败：501", str(e))
 
 
+def test_menu_screen_is_not_dialogue():
+    """C. 回主页面：菜单文字不许当台词（本次 bug 的核心）。
+
+    用户反馈：「剧情结束回到主页面时，有时无法结束录制，有时会异常开始录制」。
+    根因是主菜单的菜单项被 OCR 当成台词：
+      - 光标一动就换一个词 → 每次都被算成「新的一句」→ 推进时间永远刷新 → 不停录；
+      - 冷却（5 秒）一过，菜单项又被当成新台词 → 在主页面拉起一段废片。
+    """
+    print("\n[C1] 主菜单项不能被当成台词")
+    from galrec import ocr
+    from galrec.ocr import Line
+
+    def L(text, cy, height=30, cx=200):
+        return Line(text=text, conf=0.9,
+                    box=(cx - 80, cy - height // 2, cx + 80, cy + height // 2))
+
+    # 典型主菜单：竖排 5 个菜单项
+    menu = [L("开始游戏", 200), L("继续游戏", 260), L("载入存档", 320),
+            L("画廊", 380), L("设置", 440)]
+    check("竖排多行菜单项 → 判为菜单",
+          ocr.looks_like_menu_lines(menu) is True)
+
+    # 典型台词：1~2 行、长句、带标点
+    dlg = [L("早上好，今天也是好天气呢。", 600)]
+    check("正常台词不会被误判成菜单",
+          ocr.looks_like_menu_lines(dlg) is False)
+
+    dlg2 = [L("你这家伙，真是让人伤脑筋啊。", 580),
+            L("不过，我其实一直这么觉得。", 620)]
+    check("两行正常台词也不会被误判",
+          ocr.looks_like_menu_lines(dlg2) is False)
+
+    # ⚠ 关键反例：剧情界面底部的工具栏（同一行上的一排短按钮）
+    #   绝不能判成菜单，否则剧情中途会把录像掐断。
+    toolbar = [L("自动", 700, cx=120), L("跳过", 700, cx=260),
+               L("存档", 700, cx=400), L("设置", 700, cx=540)]
+    check("同一行的一排工具栏按钮 ≠ 主菜单（不能误停）",
+          ocr.looks_like_menu_lines(toolbar) is False)
+
+    # 两行短台词：很像但不像菜单
+    short = [L("嗯。", 600), L("好的。", 640)]
+    check("两行短台词不会被当成菜单",
+          ocr.looks_like_menu_lines(short) is False)
+
+    # 词表命不中但结构明显是菜单（自制词）
+    custom = [L("アーカイブ", 200), L("おまけもーど", 260), L("せってい", 320)]
+    check("词表外的竖排短标签仍能判为菜单",
+          ocr.looks_like_menu_lines(custom) is True)
+
+
+def test_menu_blocks_recording_on_title():
+    """C2. 主菜单上不许开录，录制中回到主菜单必须停。"""
+    print("\n[C2] 主菜单：不停录 / 乱开录 双向拦截")
+    from galrec.config import Config
+    from galrec.detector import Detector, Phase
+
+    cfg = Config()
+    cfg.detect.start_grace = 0.0
+    cfg.detect.idle_timeout = 120.0
+    cfg.detect.cooldown_seconds = 0.0     # 冷却关掉，专门验证菜单自身的拦截
+    cfg.record.auto_stop_on_title = True
+
+    now = time.time()
+
+    # --- 录制中，对话框读到菜单项 → 必须停（不能等到 idle 超时）---
+    ev = []
+    det = Detector(cfg, on_event=lambda e, p: ev.append((e, p)))
+    det.phase = Phase.RECORDING
+    det._seg_start_ts = now - 300
+    det._seg_wall_start = now - 300
+    det._last_progress_ts = now - 5        # 刚"推进"过，idle 远没到阈值
+    det._last_dialogue_ts = now - 5
+    det._menu_streak = 2                   # 连续两次读到菜单项
+    det._menu_seen_ts = now
+    det._check_end(False, False, now, "")
+    reasons = [p.get("reason") for e, p in ev if e == "segment_stop"]
+    check("录制中读到菜单项 → 立刻停（reason=title）",
+          "title" in reasons, f"reasons={reasons} phase={det.phase.value}")
+
+    # --- 没在录制，主菜单上"出现新台词" → 不许开录 ---
+    ev2 = []
+    d2 = Detector(cfg, on_event=lambda e, p: ev2.append((e, p)))
+    d2.phase = Phase.COOLDOWN
+    d2._menu_streak = 2
+    d2._menu_seen_ts = now
+    d2._last_text = "载入存档"
+    d2._maybe_begin(True, True, True, None, "自动")
+    starts = [p for e, p in ev2 if e == "segment_start"]
+    check("主菜单上不许开录（即使被判成'新台词'）",
+          len(starts) == 0, f"starts={starts}")
+
+    # --- 同一位置、没有菜单证据时仍要能正常开录（别把功能改死）---
+    ev3 = []
+    d3 = Detector(cfg, on_event=lambda e, p: ev3.append((e, p)))
+    d3.phase = Phase.COOLDOWN
+    d3._menu_streak = 0
+    d3._menu_seen_ts = 0.0
+    d3._menu_probe_ts = now            # 压住整窗探测，避免真去截图
+    d3._last_text = "早上好，今天也是好天气呢。"
+    d3._maybe_begin(True, True, True, None, "自动")
+    starts3 = [p for e, p in ev3 if e == "segment_start"]
+    check("没有菜单证据时正常开录（功能没被改死）",
+          len(starts3) == 1, f"starts={starts3}")
+
+
+def test_after_title_first_line_records():
+    """C3. 从主菜单回到剧情，第一句必须能开录（修「回了主页就再也不开录」）。"""
+    print("\n[C3] 回主菜单后再进剧情，第一句仍能开录")
+    from galrec.config import Config
+    from galrec.detector import Detector, Phase, StopReason
+
+    cfg = Config()
+    ev = []
+    det = Detector(cfg, on_event=lambda e, p: ev.append((e, p)))
+    det.phase = Phase.RECORDING
+    det._seg_start_ts = time.time() - 100
+    det._seg_wall_start = time.time() - 100
+    # 停录那一刻台词是「早上好」；玩家回主页、再开游戏，第一句又很像
+    det._last_text = "早上好"
+    det._burst_best = "早上好"
+    det._end_segment(StopReason.TITLE)
+    check("回主菜单停录后，旧台词被作废",
+          det._last_stop_text == "" and det._after_menu is True,
+          f"last_stop_text={det._last_stop_text!r} after_menu={det._after_menu}")
+
+    # 进入新剧情，第一句回来了
+    newly = det._merge_line("早上好，今天也是好天气呢。", time.time())
+    check("回主页后的第一句被判成'新的一句'（不再被相似度卡住）",
+          newly is True, f"new_line={newly}")
+
+
+def test_start_stop_race_rolls_back():
+    """C4. 停录期间的 segment_start 不许落地（否则切出 0 秒废片）。"""
+    print("\n[C4] 停录进行中收到的开录请求要作废并回滚")
+    from galrec.config import Config
+    from galrec.backend import BaseBackend
+    from galrec.recorder import Controller
+    from galrec.detector import Phase
+
+    class FakeBE(BaseBackend):
+        name = "fake"
+
+        def __init__(self):
+            self.rec = False
+            self.starts = 0
+
+        @property
+        def connected(self):
+            return True
+
+        @property
+        def label(self):
+            return "假后端"
+
+        def connect(self):
+            return True
+
+        def disconnect(self):
+            pass
+
+        def start(self):
+            self.starts += 1
+            self.rec = True
+
+        def stop(self):
+            self.rec = False
+            return ""
+
+        def recording(self):
+            return self.rec
+
+        def duration(self):
+            return 0.0
+
+    cfg = Config()
+    cfg.obs.stop_delay = 0
+    cfg.obs.restart_gap = 0
+    cfg.detect.min_record_seconds = 0
+    cfg.record.delete_short = False
+    cfg.record.remux = False
+    cfg.record.filename_template = ""
+    ctrl = Controller(cfg, log=lambda m, l="info": None)
+    be = FakeBE()
+    ctrl.backend = be
+    # 伪造：检测器已经在 RECORDING（segment_start 已经抛出去了）
+    ctrl.detector.phase = Phase.RECORDING
+    ctrl.detector.hwnd = 0x1234
+    # 伪造：停录正在进行中
+    ctrl._stopping = True
+    ctrl._start_record({"reason": "dialogue", "text": "x"})
+    check("停录进行中 → 不真的调用 StartRecord", be.starts == 0,
+          f"start 调用 {be.starts} 次")
+    check("检测器被回滚（不再卡在 RECORDING）",
+          ctrl.detector.phase is not Phase.RECORDING,
+          f"phase={ctrl.detector.phase.value}")
+
+
+def test_start_lock_failure_rolls_back():
+    """C5. 开录抢不到锁时，检测器不许留在 RECORDING（假录制状态）。"""
+    print("\n[C5] 开录抢不到锁 → 回滚检测器，不留假录制状态")
+    import threading as _th
+    from galrec.config import Config
+    from galrec.backend import BaseBackend
+    from galrec.recorder import Controller
+    from galrec.detector import Phase
+
+    class FakeBE(BaseBackend):
+        name = "fake"
+
+        @property
+        def connected(self):
+            return True
+
+        @property
+        def label(self):
+            return "假后端"
+
+        def connect(self):
+            return True
+
+        def disconnect(self):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            return ""
+
+        def recording(self):
+            return False
+
+    cfg = Config()
+    ctrl = Controller(cfg, log=lambda m, l="info": None)
+    ctrl.backend = FakeBE()
+    ctrl.detector.phase = Phase.RECORDING
+    ctrl.detector.hwnd = 0x1234
+    # 起录线程占着锁
+    ctrl._run_lock.acquire()
+    try:
+        t = _th.Thread(target=ctrl._start_record,
+                      args=({"reason": "dialogue"},), daemon=True)
+        t.start()
+        t.join(timeout=30)
+    finally:
+        try:
+            ctrl._run_lock.release()
+        except Exception:
+            pass
+    check("抢不到锁时检测器被回滚（不会永久卡在录制中）",
+          ctrl.detector.phase is not Phase.RECORDING,
+          f"phase={ctrl.detector.phase.value}")
+
+
+def test_auto_region_failure_keeps_old():
+    """C6. 自动区域探测失败不许把已有区域清空（会退化成整窗下半部分）。"""
+    print("\n[C6] 自动区域探测失败不覆盖已有区域")
+    from galrec.config import Config
+    from galrec.detector import Detector
+
+    cfg = Config()
+    det = Detector(cfg)
+    good = (0.05, 0.70, 0.95, 0.95)
+    det._auto_rel = good
+    det._detect_auto_region = lambda cl, quiet=False: None
+    det.win = FakeWindow()
+    det.hwnd = FakeWindow.hwnd
+    # 直接验证：探测返回 None 时 _auto_rel 必须保持不变
+    import galrec.windows as win_mod
+    orig = win_mod.client_rect
+    orig_alive = win_mod.is_alive
+    win_mod.client_rect = lambda hwnd: (0, 0, 1280, 720)
+    win_mod.is_alive = lambda hwnd: True
+    try:
+        det._cfg_rel = lambda: None
+        det._region_rel = None
+        det._auto_try_ts = 0.0
+        det._last_change_ts = time.time()
+        bbox, src = det._resolve_bbox()
+    finally:
+        win_mod.client_rect = orig
+        win_mod.is_alive = orig_alive
+    check("探测失败后仍沿用旧的自动区域",
+          det._auto_rel == good, f"_auto_rel={det._auto_rel}")
+    check("解析出的区域来自旧区域（不是兜底的下半屏）",
+          src == "自动", f"src={src}")
+
+
 def main() -> int:
     print("=" * 62)
-    print(" Galgame 录制 · 回归测试（最小化 / 停录灵敏性）")
+    print(" Galgame 录制 · 回归测试（最小化 / 停录灵敏性 / 回主页面）")
     print("=" * 62)
     test_minimize_stops_by_default()
     test_stop_501_is_not_failure()
@@ -643,6 +931,12 @@ def main() -> int:
     test_concurrent_requests_no_lost_state()
     test_file_release_uses_rename_probe()
     test_obs_error_carries_code()
+    test_menu_screen_is_not_dialogue()
+    test_menu_blocks_recording_on_title()
+    test_after_title_first_line_records()
+    test_start_stop_race_rolls_back()
+    test_start_lock_failure_rolls_back()
+    test_auto_region_failure_keeps_old()
 
     print("\n" + "=" * 62)
     allok = True

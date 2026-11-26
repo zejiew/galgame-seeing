@@ -241,6 +241,172 @@ def dialogue_text(lines: Sequence[Line], min_conf: float = 0.4) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 标题 / 主菜单识别
+# --------------------------------------------------------------------------- #
+#: 整行等于这些词 → 就是菜单项。都是 galgame 主菜单的标准写法。
+#: （normalize 会去掉空格，所以 "NEW GAME" 与 "NEWGAME" 都写进来）
+MENU_WORDS = (
+    "开始游戏", "新游戏", "新的游戏", "继续游戏", "开始", "继续",
+    "载入", "读取", "读取存档", "载入存档", "加载存档", "存档",
+    "退出游戏", "退出", "设置", "设定", "配置", "画廊", "鉴赏", "回想",
+    "额外内容", "特典", "安装",
+    "NEW GAME", "NEWGAME", "START", "STARTGAME", "CONTINUE", "LOAD",
+    "LOADGAME", "SAVE", "CONFIG", "SETTINGS", "OPTIONS", "EXTRA",
+    "GALLERY", "EXIT", "QUIT", "ENDFROMTITLE",
+    "はじめから", "つづきから", "ろーど", "ロード", "コンフィグ",
+    "せってい", "おまけ", "ギャラリー", "しゅうりょう", "タイトルへ",
+)
+
+#: 这些词后面常跟版本号 / 副标题 / 星号，允许「以它开头」也算菜单项。
+MENU_WORDS_PREFIX = (
+    "开始游戏", "新游戏", "新的游戏", "继续游戏", "载入存档", "加载存档",
+    "读取存档", "额外内容", "NEW GAME", "NEWGAME", "CONTINUE",
+    "GALLERY", "SETTINGS", "OPTIONS", "EXTRA",
+    "はじめから", "つづきから", "ギャラリー", "コンフィグ", "タイトルへ",
+)
+
+
+def _menu_norm(text: str) -> str:
+    return normalize(text).upper()
+
+
+#: 预先算好的归一化词表，避免每帧都重算
+_MENU_EXACT = {_menu_norm(w) for w in MENU_WORDS if _menu_norm(w)}
+_MENU_PREFIX = tuple(_menu_norm(w) for w in MENU_WORDS_PREFIX if _menu_norm(w))
+
+
+def menu_kind(text: str) -> int:
+    """这一行有多像「主菜单项」。
+
+    返回 2=很像（整行就是菜单词，且词够长够有辨识度）、
+         1=有点像（整行是 2~3 字短标签，或以菜单词开头）、
+         0=不像。
+
+    ⚠ 中文台词里「继续」「回想」这种词很容易出现（「……继续。」「回想起那天」），
+    所以 2~3 字的短标签只算「弱」证据，单行不足以定性，必须多行凑一起才算菜单。
+    """
+    core = _menu_norm(text)
+    if not core or len(core) > 16:
+        return 0
+    if core in _MENU_EXACT:
+        return 2 if len(core) >= 4 else 1
+    for cw in _MENU_PREFIX:
+        if len(core) <= len(cw) + 3 and core.startswith(cw):
+            return 1
+    return 0
+
+
+def looks_like_menu_lines(lines: Sequence[Line], max_len: int = 16) -> bool:
+    """这一批识别结果是不是主菜单/标题画面上的菜单项。
+
+    对话区域里如果读到的是菜单（有些作品的菜单就压在画面下半部分），
+    就不能把它当台词——否则光标一动就是「新的一句」，会同时造成
+    「回主页面后永远不停录」和「冷却一到又在主页面开录」。
+
+    ⚠ 关键限定：**必须竖着排成多行**。
+    galgame 剧情界面的底部工具栏（「自动 / 跳过 / 存档 / 设置 / 隐藏」）
+    也是一排短词，但它们在同一行上。只有「两个以上不同的行」才算菜单，
+    否则会把工具栏认成主菜单，在剧情中途把录像掐断。
+    """
+    cand = []
+    for l in lines:
+        core = _menu_norm(getattr(l, "text", "") or "")
+        if not core or len(core) > max_len:
+            continue
+        k = menu_kind(l.text)
+        if k:
+            cand.append((k, l))
+
+    if cand:
+        # 行数：按纵向中心分堆，间距超过半个行高就算另一行
+        rows = _row_centers([l for _k, l in cand])
+        n_rows = len(rows)
+        strong = sum(1 for k, _l in cand if k == 2)
+        weak = sum(1 for k, _l in cand if k == 1)
+        if n_rows < 2:
+            # 单行：只有当整行就是一条又长又确定的菜单词（如「NEW GAME」大按钮）
+            if strong >= 1 and any(
+                    len(_menu_norm(l.text)) >= 4 for k, l in cand if k == 2):
+                return True
+        elif strong >= 2:
+            return True
+        elif strong >= 1 and weak >= 1:
+            return True
+        elif weak >= 2 and len(cand) <= 4:
+            return True
+
+    # 词表没命中也别放过：竖排 3 行以上短标签同样是菜单
+    return looks_like_stacked_short_lines(lines, max_chars=max_len)
+
+
+def looks_like_menu_text(text: str) -> bool:
+    """单段文字（已经拼好的台词）是不是菜单项。"""
+    return menu_kind(text) == 2
+
+
+def _row_centers(lines: Sequence[Line]) -> list:
+    rows: list = []
+    for l in sorted(lines, key=lambda x: x.cy):
+        h = max(8, getattr(l, "height", 12))
+        if rows and abs(l.cy - rows[-1]) <= h * 0.5:
+            continue
+        rows.append(l.cy)
+    return rows
+
+
+def looks_like_stacked_short_lines(lines: Sequence[Line],
+                                   max_chars: int = 8,
+                                   min_rows: int = 3) -> bool:
+    """兜底判据：竖着排了 3 行以上、每行都很短 → 基本是菜单/按钮，不是台词。
+
+    有些作品的菜单项是自制词（「アーカイブ」「おまけモード」），词表命中不了。
+    但结构上仍然骗不过：对话框里的台词通常 1~3 行且至少有一行比较长；
+    主菜单是 3 行以上、每行都是两三个词的短按钮。
+
+    ⚠ 故意设得保守（≥3 行 + 每行 ≤8 字）。两行短台词（「嗯。」「好的。」）
+    很常见，不能因此把剧情中途的录像掐断。
+    """
+    good = [l for l in lines if (l.text or "").strip()]
+    if len(good) < min_rows:
+        return False
+    for l in good:
+        core = normalize(l.text)
+        if len(core) < 1 or len(core) > max_chars:
+            return False
+        # 台词会带句读；菜单项基本不带
+        if any(ch in (l.text or "") for ch in "，。！？、…"):
+            return False
+    return len(_row_centers(good)) >= min_rows
+
+
+def menu_word_hits(lines: Sequence[Line], max_len: int = 24) -> set:
+    """整窗用：这一屏命中过哪些菜单词。"""
+    return menu_evidence(lines, max_len=max_len)[0]
+
+
+def menu_evidence(lines: Sequence[Line], max_len: int = 24) -> tuple:
+    """整窗用：返回 (命中的菜单词集合, 这些命中的行数)。
+
+    行数用来排除「剧情界面底部工具栏」——那是**同一行**上的
+    「自动 / 跳过 / 存档 / 设置」，命中两三个词很正常，
+    但主菜单的菜单项是**竖着排成多行**的。
+    """
+    hits = set()
+    hit_lines = []
+    for l in lines:
+        core = _menu_norm(getattr(l, "text", "") or "")
+        if not core or len(core) > max_len:
+            continue
+        for w in MENU_WORDS:
+            cw = _menu_norm(w)
+            if cw and cw in core:
+                hits.add(w)
+                hit_lines.append(l)
+                break
+    return hits, len(_row_centers(hit_lines)) if hit_lines else 0
+
+
+# --------------------------------------------------------------------------- #
 # 对话框区域自动探测
 # --------------------------------------------------------------------------- #
 def detect_dialogue_region(
